@@ -1,0 +1,7 @@
+[slugify]
+
+[[slugify.configs]]
+collection_name = "posts"
+input_fields = ["title"]
+output_field = "slug"
+length = 64
