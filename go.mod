@@ -1,4 +1,4 @@
-module github.com/matthewdobson/pb-plugin-slug
+module github.com/mjadobson/pb-plugin-slug
 
 go 1.25.0
 
