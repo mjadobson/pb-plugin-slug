@@ -2,11 +2,14 @@ package slugify
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/pocketbase/pocketbase/core"
@@ -22,6 +25,10 @@ var version = "dev"
 
 const slugifyInProgressKey = "@slugify_in_progress"
 const maxUniqueSlugAttempts = 32
+const pluginsCollectionName = "_plugins"
+const pluginNameField = "plugin_name"
+const pluginConfigField = "config"
+const pluginEnabledField = "enabled"
 
 var nonAlphaNumericPattern = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 var duplicateHyphenPattern = regexp.MustCompile(`-+`)
@@ -34,7 +41,8 @@ type SlugConfig struct {
 }
 
 type Plugin struct {
-	Configs []SlugConfig `json:"configs"`
+	mu            sync.RWMutex
+	activeConfigs []SlugConfig
 }
 
 func init() {
@@ -54,85 +62,263 @@ func (p *Plugin) Description() string {
 }
 
 func (p *Plugin) Init(app core.App) error {
-	if err := p.validateConfigShapes(); err != nil {
+	if err := ensurePluginsCollection(app); err != nil {
 		return err
 	}
 
-	for _, cfg := range p.Configs {
-		config := cfg
-
-		app.OnRecordAfterCreateSuccess(config.CollectionName).BindFunc(func(e *core.RecordEvent) error {
-			if err := processRecord(e.Context, e.App, config, e.Record); err != nil {
-				e.App.Logger().Error(
-					"slugify create hook failed",
-					slog.String("collection", config.CollectionName),
-					slog.String("recordId", e.Record.Id),
-					slog.Any("error", err),
-				)
-			}
-
-			return e.Next()
-		})
-
-		app.OnRecordAfterUpdateSuccess(config.CollectionName).BindFunc(func(e *core.RecordEvent) error {
-			if err := processRecord(e.Context, e.App, config, e.Record); err != nil {
-				e.App.Logger().Error(
-					"slugify update hook failed",
-					slog.String("collection", config.CollectionName),
-					slog.String("recordId", e.Record.Id),
-					slog.Any("error", err),
-				)
-			}
-
-			return e.Next()
-		})
+	if err := p.reloadConfigs(app); err != nil {
+		return err
 	}
+
+	app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if err := p.handleRecordEvent(e.Context, e.App, e.Record); err != nil {
+			e.App.Logger().Error(
+				"slugify create hook failed",
+				slog.String("collection", e.Record.Collection().Name),
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
+	})
+
+	app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if err := p.handleRecordEvent(e.Context, e.App, e.Record); err != nil {
+			e.App.Logger().Error(
+				"slugify update hook failed",
+				slog.String("collection", e.Record.Collection().Name),
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
+	})
+
+	reloadPluginsHook := func(e *core.RecordEvent) error {
+		if err := p.reloadConfigs(e.App); err != nil {
+			e.App.Logger().Error(
+				"slugify config reload failed",
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
+	}
+
+	app.OnRecordAfterCreateSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
+	app.OnRecordAfterUpdateSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
+	app.OnRecordAfterDeleteSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
+
+	reloadCollectionsHook := func(e *core.CollectionEvent) error {
+		if err := p.reloadConfigs(e.App); err != nil {
+			e.App.Logger().Error(
+				"slugify config reload after collection change failed",
+				slog.String("collection", e.Collection.Name),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
+	}
+
+	app.OnCollectionAfterCreateSuccess().BindFunc(reloadCollectionsHook)
+	app.OnCollectionAfterUpdateSuccess().BindFunc(reloadCollectionsHook)
+	app.OnCollectionAfterDeleteSuccess().BindFunc(reloadCollectionsHook)
 
 	return nil
 }
 
-func (p *Plugin) validateConfigShapes() error {
-	if len(p.Configs) == 0 {
-		return fmt.Errorf("%s: at least one config entry is required", p.Name())
+func validateConfigs(app core.App, pluginName string, configs []SlugConfig) []SlugConfig {
+	if len(configs) == 0 {
+		return nil
 	}
 
-	seenTargets := make(map[string]int, len(p.Configs))
+	seenTargets := make(map[string]int, len(configs))
+	validConfigs := make([]SlugConfig, 0, len(configs))
 
-	for i, cfg := range p.Configs {
+	for i, cfg := range configs {
 		if cfg.CollectionName == "" || cfg.OutputField == "" || cfg.Length <= 0 || len(cfg.InputFields) == 0 {
-			return fmt.Errorf("%s: config %d must include collection_name, input_fields, output_field, and a positive length", p.Name(), i)
-		}
-
-		key := cfg.CollectionName + "\x00" + cfg.OutputField
-		if firstIndex, ok := seenTargets[key]; ok {
-			return fmt.Errorf("%s: config %d duplicates config %d for collection_name=%q and output_field=%q", p.Name(), i, firstIndex, cfg.CollectionName, cfg.OutputField)
-		}
-
-		seenTargets[key] = i
-	}
-
-	return nil
-}
-
-func (p *Plugin) validateStartupConfigs(app core.App) error {
-	for i, cfg := range p.Configs {
-		collection, err := app.FindCachedCollectionByNameOrId(cfg.CollectionName)
-		if err != nil {
 			app.Logger().Warn(
-				"slugify config warning",
+				"slugify config skipped",
 				slog.Int("configIndex", i),
-				slog.String("collection", cfg.CollectionName),
-				slog.Any("error", fmt.Errorf("collection %q not found yet: %w", cfg.CollectionName, err)),
+				slog.String("plugin", pluginName),
+				slog.Any("error", fmt.Errorf("%s: config %d must include collection_name, input_fields, output_field, and a positive length", pluginName, i)),
 			)
 			continue
 		}
 
+		key := cfg.CollectionName + "\x00" + cfg.OutputField
+		if firstIndex, ok := seenTargets[key]; ok {
+			app.Logger().Warn(
+				"slugify config skipped",
+				slog.Int("configIndex", i),
+				slog.String("plugin", pluginName),
+				slog.Any("error", fmt.Errorf("%s: config %d duplicates config %d for collection_name=%q and output_field=%q", pluginName, i, firstIndex, cfg.CollectionName, cfg.OutputField)),
+			)
+			continue
+		}
+
+		seenTargets[key] = i
+		collection, err := app.FindCachedCollectionByNameOrId(cfg.CollectionName)
+		if err != nil {
+			app.Logger().Warn(
+				"slugify config deferred",
+				slog.Int("configIndex", i),
+				slog.String("plugin", pluginName),
+				slog.String("collection", cfg.CollectionName),
+				slog.Any("error", fmt.Errorf("collection %q not found yet: %w", cfg.CollectionName, err)),
+			)
+			validConfigs = append(validConfigs, cfg)
+			continue
+		}
+
 		if err := validateConfigForCollection(cfg, collection); err != nil {
-			return fmt.Errorf("%s: config %d invalid: %w", p.Name(), i, err)
+			app.Logger().Warn(
+				"slugify config skipped",
+				slog.Int("configIndex", i),
+				slog.String("plugin", pluginName),
+				slog.String("collection", cfg.CollectionName),
+				slog.Any("error", fmt.Errorf("%s: config %d invalid: %w", pluginName, i, err)),
+			)
+			continue
+		}
+
+		validConfigs = append(validConfigs, cfg)
+	}
+
+	return validConfigs
+}
+
+func ensurePluginsCollection(app core.App) error {
+	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+	if err != nil {
+		if !errorsIsNotFound(err) {
+			return err
+		}
+
+		collection = core.NewBaseCollection(pluginsCollectionName)
+	}
+
+	if collection.Fields.GetByName(pluginNameField) == nil {
+		collection.Fields.Add(&core.TextField{Name: pluginNameField, Required: true})
+	}
+
+	if collection.Fields.GetByName(pluginConfigField) == nil {
+		collection.Fields.Add(&core.JSONField{Name: pluginConfigField})
+	}
+
+	if collection.Fields.GetByName(pluginEnabledField) == nil {
+		collection.Fields.Add(&core.BoolField{Name: pluginEnabledField})
+	}
+
+	if _, ok := dbutils.FindSingleColumnUniqueIndex(collection.Indexes, pluginNameField); !ok {
+		collection.AddIndex("idx__plugins_plugin_name_unique", true, "`plugin_name`", "")
+	}
+
+	return app.Save(collection)
+}
+
+func (p *Plugin) reloadConfigs(app core.App) error {
+	configs, enabled, err := p.loadConfigs(app)
+	if err != nil {
+		p.mu.Lock()
+		p.activeConfigs = nil
+		p.mu.Unlock()
+
+		return err
+	}
+
+	if !enabled {
+		configs = nil
+	}
+
+	p.mu.Lock()
+	p.activeConfigs = slicesClone(configs)
+	p.mu.Unlock()
+
+	return nil
+}
+
+func (p *Plugin) loadConfigs(app core.App) ([]SlugConfig, bool, error) {
+	record, err := app.FindFirstRecordByFilter(
+		pluginsCollectionName,
+		pluginNameField+" = {:pluginName}",
+		map[string]any{"pluginName": p.Name()},
+	)
+	if err != nil {
+		if errorsIsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, err
+	}
+
+	if !record.GetBool(pluginEnabledField) {
+		return nil, false, nil
+	}
+
+	var configs []SlugConfig
+	if err := record.UnmarshalJSONField(pluginConfigField, &configs); err != nil {
+		return nil, false, fmt.Errorf("%s: invalid config json: %w", p.Name(), err)
+	}
+
+	return validateConfigs(app, p.Name(), configs), true, nil
+}
+
+func (p *Plugin) handleRecordEvent(ctx context.Context, app core.App, record *core.Record) error {
+	if record.Collection().Name == pluginsCollectionName {
+		return nil
+	}
+
+	configs := p.getConfigsForRecord(record)
+	for _, cfg := range configs {
+		if err := processRecord(ctx, app, cfg, record); err != nil {
+			app.Logger().Error(
+				"slugify record processing failed",
+				slog.String("collection", record.Collection().Name),
+				slog.String("recordId", record.Id),
+				slog.String("outputField", cfg.OutputField),
+				slog.Any("error", err),
+			)
 		}
 	}
 
 	return nil
+}
+
+func (p *Plugin) getConfigsForRecord(record *core.Record) []SlugConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.activeConfigs) == 0 {
+		return nil
+	}
+
+	result := make([]SlugConfig, 0, len(p.activeConfigs))
+	for _, cfg := range p.activeConfigs {
+		if cfg.CollectionName == record.Collection().Name || cfg.CollectionName == record.Collection().Id {
+			result = append(result, cfg)
+		}
+	}
+
+	return result
+}
+
+func slicesClone(configs []SlugConfig) []SlugConfig {
+	if len(configs) == 0 {
+		return nil
+	}
+
+	cloned := make([]SlugConfig, len(configs))
+	copy(cloned, configs)
+	return cloned
+}
+
+func errorsIsNotFound(err error) bool {
+	return err != nil && (errors.Is(err, sql.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "no rows"))
 }
 
 func validateConfigForCollection(cfg SlugConfig, collection *core.Collection) error {

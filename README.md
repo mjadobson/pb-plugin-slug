@@ -14,31 +14,43 @@ xpb build --with github.com/mjadobson/pb-plugin-slug@latest
 
 ## Setup
 
-Add the plugin config to your `pocketbuilds.toml`:
+On startup the plugin creates a shared `_plugins` collection if it doesn't already exist.
 
-```toml
-[slugify]
+Create or update the `slugify` row in `_plugins` with:
 
-[[slugify.configs]]
-collection_name = "posts"
-input_fields = ["title", "subtitle"]
-output_field = "slug"
-length = 64
+- `plugin_name`: `slugify`
+- `enabled`: `true` or `false`
+- `config`: JSON config
 
-[[slugify.configs]]
-collection_name = "pages"
-input_fields = ["title"]
-output_field = "slug"
-length = 32
+Example `config` value:
+
+```json
+[
+  {
+    "collection_name": "posts",
+    "input_fields": ["title", "subtitle"],
+    "output_field": "slug",
+    "length": 64
+  },
+  {
+    "collection_name": "pages",
+    "input_fields": ["title"],
+    "output_field": "slug",
+    "length": 32
+  }
+]
 ```
 
-Then make sure each collection has:
+Then make sure each target collection has:
 
 - the fields listed in `input_fields`
 - a text or editor field matching `output_field`
 - a single-column `UNIQUE` index on `output_field` (recommended with `WHERE output_field != ''`)
 
 The plugin runs after successful record create and update operations.
+It reloads its active config whenever any row in `_plugins` is created, updated, or deleted.
+It also reloads when collections are created, updated, or deleted so deferred configs can become active after schema changes.
+It does not backfill slugs for existing records; it only applies to records saved after the config is active.
 
 ## Unique Index Requirement
 
@@ -56,23 +68,19 @@ Replace `posts` and `slug` with your collection and field names.
 
 ## Plugin Config
 
-### `configs`
-
-An array of slug rules.
-
-### `configs[].collection_name`
+### `[].collection_name`
 
 The PocketBase collection name to watch.
 
-### `configs[].input_fields`
+### `[].input_fields`
 
 The fields to combine, in order, before generating the slug.
 
-### `configs[].output_field`
+### `[].output_field`
 
 The text or editor field where the slug should be written.
 
-### `configs[].length`
+### `[].length`
 
 The maximum slug length.
 
@@ -86,6 +94,7 @@ The maximum slug length.
 - If the slug already exists in the same collection, `-1`, `-2`, and so on are appended while staying within `length`.
 - If all configured inputs are blank, the output slug is cleared.
 - The output field must have its own unique index so concurrent writes cannot create duplicate slugs.
+- Invalid config entries are skipped individually so valid rules can continue to run.
 
 ## Development
 
