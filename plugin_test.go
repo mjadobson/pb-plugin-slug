@@ -469,6 +469,60 @@ func TestPluginReloadsConfigWhenPluginsRecordChanges(t *testing.T) {
 	}
 }
 
+func TestPluginReloadsConfigWhenPluginsRecordJSONIsSetAsString(t *testing.T) {
+	app := newTestApp(t)
+
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(
+		&core.TextField{Name: "title"},
+		&core.TextField{Name: "slug"},
+	)
+	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
+
+	if err := app.Save(posts); err != nil {
+		t.Fatalf("failed to save posts collection: %v", err)
+	}
+
+	if err := ensurePluginsCollection(app); err != nil {
+		t.Fatalf("failed to ensure plugins collection: %v", err)
+	}
+
+	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
+		{
+			CollectionName: "posts",
+			InputFields:    []string{"title"},
+			OutputField:    "slug",
+			Length:         12,
+		},
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	pluginRecord.Set(pluginConfigField, `[
+		{
+			"collection_name": "posts",
+			"input_fields": ["title"],
+			"output_field": "slug",
+			"length": 8
+		}
+	]`)
+	if err := app.Save(pluginRecord); err != nil {
+		t.Fatalf("failed to update plugin config with string json: %v", err)
+	}
+
+	record := core.NewRecord(posts)
+	record.Set("title", "Longer Title")
+	if err := app.Save(record); err != nil {
+		t.Fatalf("failed to save record after string-json config update: %v", err)
+	}
+	if got := record.GetString("slug"); got != "longer-t" {
+		t.Fatalf("unexpected slug after string-json config update: got %q want %q", got, "longer-t")
+	}
+}
+
 func TestPluginClearsActiveConfigOnInvalidReload(t *testing.T) {
 	app := newTestApp(t)
 

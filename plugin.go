@@ -3,6 +3,7 @@ package slugify
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -278,8 +279,13 @@ func (p *Plugin) loadConfigs(app core.App) ([]SlugConfig, bool, error) {
 		return nil, false, nil
 	}
 
+	raw, ok := record.GetRaw(pluginConfigField).(types.JSONRaw)
+	if !ok {
+		return nil, false, fmt.Errorf("%s: config field is not json", p.Name())
+	}
+
 	var configs []SlugConfig
-	if err := record.UnmarshalJSONField(pluginConfigField, &configs); err != nil {
+	if err := json.Unmarshal(raw, &configs); err != nil {
 		return nil, false, fmt.Errorf("%s: invalid config json: %w", p.Name(), err)
 	}
 
