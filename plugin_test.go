@@ -338,6 +338,41 @@ func TestInitCreatesPluginsCollectionWithoutConfig(t *testing.T) {
 	}
 }
 
+func TestInitDefersStorageSetupUntilBootstrap(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "pb_data")
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir: dataDir,
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin before bootstrap: %v", err)
+	}
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("failed to bootstrap pocketbase app: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := app.ResetBootstrapState(); err != nil {
+			t.Fatalf("failed to reset pocketbase app: %v", err)
+		}
+
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Fatalf("failed to remove pocketbase data dir: %v", err)
+		}
+	})
+
+	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+	if err != nil {
+		t.Fatalf("expected %s collection to exist after bootstrap: %v", pluginsCollectionName, err)
+	}
+
+	if collection.Fields.GetByName(pluginNameField) == nil {
+		t.Fatalf("expected %s field to exist after bootstrap", pluginNameField)
+	}
+}
+
 func TestPluginReloadsConfigWhenPluginsRecordChanges(t *testing.T) {
 	app := newTestApp(t)
 

@@ -62,13 +62,19 @@ func (p *Plugin) Description() string {
 }
 
 func (p *Plugin) Init(app core.App) error {
-	if err := ensurePluginsCollection(app); err != nil {
-		return err
+	if app.IsBootstrapped() {
+		if err := p.initialize(app); err != nil {
+			return err
+		}
 	}
 
-	if err := p.reloadConfigs(app); err != nil {
-		return err
-	}
+	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+		if err := e.Next(); err != nil {
+			return err
+		}
+
+		return p.initialize(e.App)
+	})
 
 	app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if err := p.handleRecordEvent(e.Context, e.App, e.Record); err != nil {
@@ -127,6 +133,18 @@ func (p *Plugin) Init(app core.App) error {
 	app.OnCollectionAfterCreateSuccess().BindFunc(reloadCollectionsHook)
 	app.OnCollectionAfterUpdateSuccess().BindFunc(reloadCollectionsHook)
 	app.OnCollectionAfterDeleteSuccess().BindFunc(reloadCollectionsHook)
+
+	return nil
+}
+
+func (p *Plugin) initialize(app core.App) error {
+	if err := ensurePluginsCollection(app); err != nil {
+		return err
+	}
+
+	if err := p.reloadConfigs(app); err != nil {
+		return err
+	}
 
 	return nil
 }
