@@ -28,9 +28,10 @@ Example `config` value:
 [
   {
     "collection_name": "posts",
-    "input_fields": ["title", "subtitle"],
+    "input_fields": ["title", "docs.name"],
     "output_field": "slug",
-    "length": 64
+    "length": 64,
+    "recalculate": true
   },
   {
     "collection_name": "pages",
@@ -50,7 +51,7 @@ Then make sure each target collection has:
 The plugin runs after successful record create and update operations.
 It reloads its active config whenever any row in `_plugins` is created, updated, or deleted.
 It also reloads when collections are created, updated, or deleted so deferred configs can become active after schema changes.
-It does not backfill slugs for existing records; it only applies to records saved after the config is active.
+It does not backfill slugs for existing records unless you set `recalculate: true` on a config entry.
 
 ## Unique Index Requirement
 
@@ -76,6 +77,9 @@ The PocketBase collection name to watch.
 
 The fields to combine, in order, before generating the slug.
 
+Use dotted paths such as `docs.name` to pull values from related collections.
+Intermediate segments must be relation fields.
+
 ### `[].output_field`
 
 The text or editor field where the slug should be written.
@@ -84,9 +88,15 @@ The text or editor field where the slug should be written.
 
 The maximum slug length.
 
+### `[].recalculate`
+
+Optional.
+When set to `true`, the plugin rewrites that config entry to `recalculating: true`, recalculates matching records in batches of 100, and then removes `recalculating` when the pass finishes.
+
 ## Behaviour
 
 - Input field values are joined with spaces in config order.
+- Array-like input values are flattened and joined with spaces before slugging.
 - Accents are removed where possible.
 - Non-alphanumeric characters become hyphens.
 - Repeated separators are collapsed and trimmed.

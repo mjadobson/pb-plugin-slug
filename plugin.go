@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/dbutils"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -26,6 +28,7 @@ var version = "dev"
 
 const slugifyInProgressKey = "@slugify_in_progress"
 const maxUniqueSlugAttempts = 32
+const recalculateBatchSize = 100
 const pluginsCollectionName = "_plugins"
 const pluginNameField = "plugin_name"
 const pluginConfigField = "config"
@@ -39,11 +42,14 @@ type SlugConfig struct {
 	InputFields    []string `json:"input_fields"`
 	OutputField    string   `json:"output_field"`
 	Length         int      `json:"length"`
+	Recalculate    bool     `json:"recalculate,omitempty"`
+	Recalculating  bool     `json:"recalculating,omitempty"`
 }
 
 type Plugin struct {
-	mu            sync.RWMutex
-	activeConfigs []SlugConfig
+	mu               sync.RWMutex
+	activeConfigs    []SlugConfig
+	recalcInProgress bool
 }
 
 func init() {
@@ -194,7 +200,7 @@ func validateConfigs(app core.App, pluginName string, configs []SlugConfig) []Sl
 			continue
 		}
 
-		if err := validateConfigForCollection(cfg, collection); err != nil {
+		if err := validateConfigForCollection(app, cfg, collection); err != nil {
 			app.Logger().Warn(
 				"slugify config skipped",
 				slog.Int("configIndex", i),
@@ -241,7 +247,7 @@ func ensurePluginsCollection(app core.App) error {
 }
 
 func (p *Plugin) reloadConfigs(app core.App) error {
-	configs, enabled, err := p.loadConfigs(app)
+	record, enabled, err := p.loadConfigRecord(app)
 	if err != nil {
 		p.mu.Lock()
 		p.activeConfigs = nil
@@ -251,17 +257,43 @@ func (p *Plugin) reloadConfigs(app core.App) error {
 	}
 
 	if !enabled {
-		configs = nil
+		p.mu.Lock()
+		p.activeConfigs = nil
+		p.mu.Unlock()
+
+		return nil
+	}
+
+	configs, err := decodeConfigs(record.GetRaw(pluginConfigField))
+	if err != nil {
+		p.mu.Lock()
+		p.activeConfigs = nil
+		p.mu.Unlock()
+
+		return fmt.Errorf("%s: %w", p.Name(), err)
+	}
+
+	if hasRecalculateRequest(configs) && p.beginRecalculation() {
+		defer p.endRecalculation()
+
+		configs, err = p.runRecalculation(app, record, configs)
+		if err != nil {
+			p.mu.Lock()
+			p.activeConfigs = nil
+			p.mu.Unlock()
+
+			return err
+		}
 	}
 
 	p.mu.Lock()
-	p.activeConfigs = slicesClone(configs)
+	p.activeConfigs = slicesClone(validateConfigs(app, p.Name(), configs))
 	p.mu.Unlock()
 
 	return nil
 }
 
-func (p *Plugin) loadConfigs(app core.App) ([]SlugConfig, bool, error) {
+func (p *Plugin) loadConfigRecord(app core.App) (*core.Record, bool, error) {
 	record, err := app.FindFirstRecordByFilter(
 		pluginsCollectionName,
 		pluginNameField+" = {:pluginName}",
@@ -279,17 +311,21 @@ func (p *Plugin) loadConfigs(app core.App) ([]SlugConfig, bool, error) {
 		return nil, false, nil
 	}
 
-	raw, ok := record.GetRaw(pluginConfigField).(types.JSONRaw)
+	return record, true, nil
+}
+
+func decodeConfigs(rawValue any) ([]SlugConfig, error) {
+	raw, ok := rawValue.(types.JSONRaw)
 	if !ok {
-		return nil, false, fmt.Errorf("%s: config field is not json", p.Name())
+		return nil, fmt.Errorf("config field is not json")
 	}
 
 	var configs []SlugConfig
 	if err := json.Unmarshal(raw, &configs); err != nil {
-		return nil, false, fmt.Errorf("%s: invalid config json: %w", p.Name(), err)
+		return nil, fmt.Errorf("invalid config json: %w", err)
 	}
 
-	return validateConfigs(app, p.Name(), configs), true, nil
+	return configs, nil
 }
 
 func (p *Plugin) handleRecordEvent(ctx context.Context, app core.App, record *core.Record) error {
@@ -345,7 +381,7 @@ func errorsIsNotFound(err error) bool {
 	return err != nil && (errors.Is(err, sql.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "no rows"))
 }
 
-func validateConfigForCollection(cfg SlugConfig, collection *core.Collection) error {
+func validateConfigForCollection(app core.App, cfg SlugConfig, collection *core.Collection) error {
 	for _, fieldName := range cfg.InputFields {
 		if fieldName == "" {
 			return fmt.Errorf("input field names in collection %q cannot be empty", cfg.CollectionName)
@@ -355,8 +391,8 @@ func validateConfigForCollection(cfg SlugConfig, collection *core.Collection) er
 			return fmt.Errorf("output field %q in collection %q cannot also be listed in input_fields", cfg.OutputField, cfg.CollectionName)
 		}
 
-		if collection.Fields.GetByName(fieldName) == nil {
-			return fmt.Errorf("input field %q not found in collection %q", fieldName, cfg.CollectionName)
+		if err := validateInputFieldPath(app, cfg, collection, fieldName); err != nil {
+			return err
 		}
 	}
 
@@ -376,6 +412,40 @@ func validateConfigForCollection(cfg SlugConfig, collection *core.Collection) er
 	return nil
 }
 
+func validateInputFieldPath(app core.App, cfg SlugConfig, collection *core.Collection, path string) error {
+	segments := strings.Split(path, ".")
+	currentCollection := collection
+
+	for i, segment := range segments {
+		if segment == "" {
+			return fmt.Errorf("input field path %q in collection %q cannot contain empty segments", path, cfg.CollectionName)
+		}
+
+		field := currentCollection.Fields.GetByName(segment)
+		if field == nil {
+			return fmt.Errorf("input field %q not found in collection %q", segment, currentCollection.Name)
+		}
+
+		if i == len(segments)-1 {
+			return nil
+		}
+
+		relationField, ok := field.(*core.RelationField)
+		if !ok {
+			return fmt.Errorf("input field path %q in collection %q must use relation fields before the final segment", path, cfg.CollectionName)
+		}
+
+		nextCollection, err := app.FindCachedCollectionByNameOrId(relationField.CollectionId)
+		if err != nil {
+			return fmt.Errorf("related collection %q for input field path %q in collection %q could not be loaded: %w", relationField.CollectionId, path, cfg.CollectionName, err)
+		}
+
+		currentCollection = nextCollection
+	}
+
+	return nil
+}
+
 func isSupportedOutputField(field core.Field) bool {
 	switch field.(type) {
 	case *core.TextField, *core.EditorField:
@@ -390,13 +460,18 @@ func processRecord(ctx context.Context, app core.App, cfg SlugConfig, record *co
 		return nil
 	}
 
-	if err := validateConfigForCollection(cfg, record.Collection()); err != nil {
+	if err := validateConfigForCollection(app, cfg, record.Collection()); err != nil {
 		return err
 	}
 
 	values := make([]string, 0, len(cfg.InputFields))
 	for _, fieldName := range cfg.InputFields {
-		values = append(values, record.GetString(fieldName))
+		resolved, err := resolveInputValues(app, record, fieldName)
+		if err != nil {
+			return err
+		}
+
+		values = append(values, resolved...)
 	}
 
 	baseSlug := buildSlug(values, cfg.Length)
@@ -425,6 +500,131 @@ func processRecord(ctx context.Context, app core.App, cfg SlugConfig, record *co
 	}
 
 	return nil
+}
+
+func resolveInputValues(app core.App, record *core.Record, inputField string) ([]string, error) {
+	segments := strings.Split(inputField, ".")
+	if len(segments) == 1 {
+		field := record.Collection().Fields.GetByName(inputField)
+		if field == nil {
+			return nil, fmt.Errorf("input field %q not found in collection %q", inputField, record.Collection().Name)
+		}
+
+		return flattenValueStrings(record.Get(field.GetName())), nil
+	}
+
+	currentCollection := record.Collection()
+	currentRecords := []*core.Record{record}
+
+	for i, segment := range segments {
+		field := currentCollection.Fields.GetByName(segment)
+		if field == nil {
+			return nil, fmt.Errorf("input field %q not found in collection %q", segment, currentCollection.Name)
+		}
+
+		if i == len(segments)-1 {
+			values := make([]string, 0, len(currentRecords))
+			for _, currentRecord := range currentRecords {
+				values = append(values, flattenValueStrings(currentRecord.Get(field.GetName()))...)
+			}
+
+			return values, nil
+		}
+
+		relationField, ok := field.(*core.RelationField)
+		if !ok {
+			return nil, fmt.Errorf("input field path %q in collection %q must use relation fields before the final segment", inputField, record.Collection().Name)
+		}
+
+		nextRecords, nextCollection, err := loadRelatedRecords(app, currentRecords, relationField)
+		if err != nil {
+			return nil, err
+		}
+
+		currentRecords = nextRecords
+		currentCollection = nextCollection
+	}
+
+	return nil, nil
+}
+
+func loadRelatedRecords(app core.App, records []*core.Record, field *core.RelationField) ([]*core.Record, *core.Collection, error) {
+	nextCollection, err := app.FindCachedCollectionByNameOrId(field.CollectionId)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load relation collection %q for field %q: %w", field.CollectionId, field.Name, err)
+	}
+
+	orderedIDs := make([]string, 0, len(records))
+	seenIDs := make(map[string]struct{})
+	uniqueIDs := make([]string, 0, len(records))
+
+	for _, record := range records {
+		for _, id := range record.GetStringSlice(field.Name) {
+			orderedIDs = append(orderedIDs, id)
+			if _, ok := seenIDs[id]; ok {
+				continue
+			}
+
+			seenIDs[id] = struct{}{}
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+
+	if len(uniqueIDs) == 0 {
+		return nil, nextCollection, nil
+	}
+
+	relatedRecords, err := app.FindRecordsByIds(nextCollection.Id, uniqueIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load related records for field %q: %w", field.Name, err)
+	}
+
+	recordIndex := make(map[string]*core.Record, len(relatedRecords))
+	for _, relatedRecord := range relatedRecords {
+		recordIndex[relatedRecord.Id] = relatedRecord
+	}
+
+	orderedRecords := make([]*core.Record, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		if relatedRecord := recordIndex[id]; relatedRecord != nil {
+			orderedRecords = append(orderedRecords, relatedRecord)
+		}
+	}
+
+	return orderedRecords, nextCollection, nil
+}
+
+func flattenValueStrings(value any) []string {
+	if value == nil {
+		return nil
+	}
+
+	switch v := value.(type) {
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil
+		}
+
+		return []string{v}
+	case fmt.Stringer:
+		return flattenValueStrings(v.String())
+	}
+
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		values := make([]string, 0, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			values = append(values, flattenValueStrings(rv.Index(i).Interface())...)
+		}
+
+		return values
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Float32, reflect.Float64:
+		return []string{fmt.Sprint(value)}
+	default:
+		return nil
+	}
 }
 
 func buildSlug(values []string, length int) string {
@@ -541,4 +741,133 @@ func isUniqueConstraintError(err error) bool {
 	}
 
 	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
+}
+
+func hasRecalculateRequest(configs []SlugConfig) bool {
+	for _, cfg := range configs {
+		if cfg.Recalculate {
+			return true
+		}
+	}
+
+	return false
+}
+
+func normalizeRecalculateFlags(configs []SlugConfig) []SlugConfig {
+	normalized := slicesClone(configs)
+	for i := range normalized {
+		if normalized[i].Recalculate {
+			normalized[i].Recalculate = false
+			normalized[i].Recalculating = true
+		}
+	}
+
+	return normalized
+}
+
+func clearRecalculatingFlags(configs []SlugConfig) []SlugConfig {
+	cleared := slicesClone(configs)
+	for i := range cleared {
+		cleared[i].Recalculate = false
+		cleared[i].Recalculating = false
+	}
+
+	return cleared
+}
+
+func (p *Plugin) beginRecalculation() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.recalcInProgress {
+		return false
+	}
+
+	p.recalcInProgress = true
+	return true
+}
+
+func (p *Plugin) endRecalculation() {
+	p.mu.Lock()
+	p.recalcInProgress = false
+	p.mu.Unlock()
+}
+
+func (p *Plugin) runRecalculation(app core.App, record *core.Record, configs []SlugConfig) (finalConfigs []SlugConfig, err error) {
+	runningConfigs := normalizeRecalculateFlags(configs)
+	if err := updatePluginConfigRecord(app, record, runningConfigs); err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		clearedConfigs := clearRecalculatingFlags(runningConfigs)
+		cleanupErr := updatePluginConfigRecord(app, record, clearedConfigs)
+		if cleanupErr != nil {
+			cleanupErr = fmt.Errorf("failed to clear recalculation flags: %w", cleanupErr)
+			if err != nil {
+				err = errors.Join(err, cleanupErr)
+			} else {
+				err = cleanupErr
+			}
+			return
+		}
+
+		if err == nil {
+			finalConfigs = clearedConfigs
+		}
+	}()
+
+	for _, cfg := range validateConfigs(app, p.Name(), runningConfigs) {
+		if !cfg.Recalculating {
+			continue
+		}
+
+		if err := recalculateCollection(app, cfg); err != nil {
+			return nil, err
+		}
+	}
+
+	return finalConfigs, nil
+}
+
+func updatePluginConfigRecord(app core.App, record *core.Record, configs []SlugConfig) error {
+	raw, err := json.Marshal(configs)
+	if err != nil {
+		return err
+	}
+
+	record.SetRaw(pluginConfigField, types.JSONRaw(raw))
+	record.Set("updated", types.NowDateTime())
+
+	return app.SaveNoValidate(record)
+}
+
+func recalculateCollection(app core.App, cfg SlugConfig) error {
+	lastID := ""
+
+	for {
+		filter := ""
+		var params []dbx.Params
+		if lastID != "" {
+			filter = "id > {:lastId}"
+			params = append(params, dbx.Params{"lastId": lastID})
+		}
+
+		records, err := app.FindRecordsByFilter(cfg.CollectionName, filter, "id", recalculateBatchSize, 0, params...)
+		if err != nil {
+			return fmt.Errorf("failed to load records for recalculation in collection %q: %w", cfg.CollectionName, err)
+		}
+
+		if len(records) == 0 {
+			return nil
+		}
+
+		for _, record := range records {
+			if err := processRecord(context.Background(), app, cfg, record); err != nil {
+				return fmt.Errorf("failed to recalculate slug for record %q in collection %q: %w", record.Id, cfg.CollectionName, err)
+			}
+		}
+
+		lastID = records[len(records)-1].Id
+	}
 }

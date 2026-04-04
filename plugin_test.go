@@ -2,6 +2,8 @@ package slugify
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -261,6 +263,112 @@ func TestPluginPocketBaseIntegrationCreatesAndUpdatesSlugs(t *testing.T) {
 	}
 }
 
+func TestPluginBuildsSlugFromRelatedCollectionFields(t *testing.T) {
+	app := newTestApp(t)
+
+	docs := core.NewBaseCollection("docs")
+	docs.Fields.Add(&core.TextField{Name: "name"})
+	if err := app.Save(docs); err != nil {
+		t.Fatalf("failed to save docs collection: %v", err)
+	}
+
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(
+		&core.TextField{Name: "title"},
+		&core.RelationField{Name: "docs", CollectionId: docs.Id, MaxSelect: 10},
+		&core.TextField{Name: "slug"},
+	)
+	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
+	if err := app.Save(posts); err != nil {
+		t.Fatalf("failed to save posts collection: %v", err)
+	}
+
+	if err := ensurePluginsCollection(app); err != nil {
+		t.Fatalf("failed to ensure plugins collection: %v", err)
+	}
+
+	createPluginConfigRecord(t, app, true, []SlugConfig{
+		{
+			CollectionName: "posts",
+			InputFields:    []string{"docs.name", "title"},
+			OutputField:    "slug",
+			Length:         64,
+		},
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	firstDoc := core.NewRecord(docs)
+	firstDoc.Set("name", "Alpha Guide")
+	if err := app.Save(firstDoc); err != nil {
+		t.Fatalf("failed to save first doc: %v", err)
+	}
+
+	secondDoc := core.NewRecord(docs)
+	secondDoc.Set("name", "Beta Notes")
+	if err := app.Save(secondDoc); err != nil {
+		t.Fatalf("failed to save second doc: %v", err)
+	}
+
+	post := core.NewRecord(posts)
+	post.Set("title", "Launch")
+	post.Set("docs", []string{firstDoc.Id, secondDoc.Id})
+	if err := app.Save(post); err != nil {
+		t.Fatalf("failed to save post: %v", err)
+	}
+
+	if got := post.GetString("slug"); got != "alpha-guide-beta-notes-launch" {
+		t.Fatalf("unexpected slug from related fields: got %q want %q", got, "alpha-guide-beta-notes-launch")
+	}
+}
+
+func TestPluginFlattensArrayInputFieldsWithWhitespace(t *testing.T) {
+	app := newTestApp(t)
+
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(
+		&core.TextField{Name: "title"},
+		&core.SelectField{Name: "tags", Values: []string{"red", "green", "blue"}, MaxSelect: 3},
+		&core.TextField{Name: "slug"},
+	)
+	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
+	if err := app.Save(posts); err != nil {
+		t.Fatalf("failed to save posts collection: %v", err)
+	}
+
+	if err := ensurePluginsCollection(app); err != nil {
+		t.Fatalf("failed to ensure plugins collection: %v", err)
+	}
+
+	createPluginConfigRecord(t, app, true, []SlugConfig{
+		{
+			CollectionName: "posts",
+			InputFields:    []string{"title", "tags"},
+			OutputField:    "slug",
+			Length:         64,
+		},
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	post := core.NewRecord(posts)
+	post.Set("title", "Palette")
+	post.Set("tags", []string{"red", "blue"})
+	if err := app.Save(post); err != nil {
+		t.Fatalf("failed to save post: %v", err)
+	}
+
+	if got := post.GetString("slug"); got != "palette-red-blue" {
+		t.Fatalf("unexpected slug from array input: got %q want %q", got, "palette-red-blue")
+	}
+}
+
 func TestPluginClearsSlugWhenInputsAreBlank(t *testing.T) {
 	app := newTestApp(t)
 
@@ -466,6 +574,143 @@ func TestPluginReloadsConfigWhenPluginsRecordChanges(t *testing.T) {
 	}
 	if got := afterDelete.GetString("slug"); got != "" {
 		t.Fatalf("expected no slug after config delete, got %q", got)
+	}
+}
+
+func TestPluginRecalculatesExistingRecordsInBatches(t *testing.T) {
+	app := newTestApp(t)
+
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(
+		&core.TextField{Name: "title"},
+		&core.TextField{Name: "slug"},
+	)
+	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
+	if err := app.Save(posts); err != nil {
+		t.Fatalf("failed to save posts collection: %v", err)
+	}
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	records := make([]*core.Record, 0, 105)
+	for i := 0; i < 105; i++ {
+		record := core.NewRecord(posts)
+		record.Set("title", fmt.Sprintf("Post %d", i))
+		if err := app.Save(record); err != nil {
+			t.Fatalf("failed to save pre-config record %d: %v", i, err)
+		}
+		records = append(records, record)
+	}
+
+	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
+		{
+			CollectionName: "posts",
+			InputFields:    []string{"title"},
+			OutputField:    "slug",
+			Length:         64,
+			Recalculate:    true,
+		},
+	})
+
+	for _, idx := range []int{0, 99, 104} {
+		refreshed, err := app.FindRecordById(posts.Id, records[idx].Id)
+		if err != nil {
+			t.Fatalf("failed to reload record %d: %v", idx, err)
+		}
+
+		want := fmt.Sprintf("post-%d", idx)
+		if got := refreshed.GetString("slug"); got != want {
+			t.Fatalf("unexpected recalculated slug for record %d: got %q want %q", idx, got, want)
+		}
+	}
+
+	refreshedPluginRecord, err := app.FindRecordById(pluginRecord.Collection().Id, pluginRecord.Id)
+	if err != nil {
+		t.Fatalf("failed to reload plugin record: %v", err)
+	}
+
+	var savedConfigs []SlugConfig
+	if err := json.Unmarshal([]byte(refreshedPluginRecord.GetString(pluginConfigField)), &savedConfigs); err != nil {
+		t.Fatalf("failed to unmarshal saved plugin config: %v", err)
+	}
+
+	if len(savedConfigs) != 1 {
+		t.Fatalf("unexpected saved config count: got %d want 1", len(savedConfigs))
+	}
+
+	if savedConfigs[0].Recalculate || savedConfigs[0].Recalculating {
+		t.Fatalf("expected recalculate flags to be cleared, got %+v", savedConfigs[0])
+	}
+}
+
+func TestPluginClearsRecalculateFlagsAfterBackfillFailure(t *testing.T) {
+	app := newTestApp(t)
+
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(
+		&core.TextField{Name: "title"},
+		&core.TextField{Name: "slug"},
+	)
+	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
+	if err := app.Save(posts); err != nil {
+		t.Fatalf("failed to save posts collection: %v", err)
+	}
+
+	blockedTitle := "Break Me"
+	app.OnRecordUpdate(posts.Name).BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.GetRaw(slugifyInProgressKey) == true && e.Record.GetString("title") == blockedTitle {
+			return errors.New("forced recalc failure")
+		}
+
+		return e.Next()
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	okRecord := core.NewRecord(posts)
+	okRecord.Set("title", "Works Fine")
+	if err := app.Save(okRecord); err != nil {
+		t.Fatalf("failed to save ok record: %v", err)
+	}
+
+	badRecord := core.NewRecord(posts)
+	badRecord.Set("title", blockedTitle)
+	if err := app.Save(badRecord); err != nil {
+		t.Fatalf("failed to save blocked record: %v", err)
+	}
+
+	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
+		{
+			CollectionName: "posts",
+			InputFields:    []string{"title"},
+			OutputField:    "slug",
+			Length:         64,
+			Recalculate:    true,
+		},
+	})
+
+	refreshedPluginRecord, err := app.FindRecordById(pluginRecord.Collection().Id, pluginRecord.Id)
+	if err != nil {
+		t.Fatalf("failed to reload plugin record: %v", err)
+	}
+
+	var savedConfigs []SlugConfig
+	if err := json.Unmarshal([]byte(refreshedPluginRecord.GetString(pluginConfigField)), &savedConfigs); err != nil {
+		t.Fatalf("failed to unmarshal saved plugin config: %v", err)
+	}
+
+	if len(savedConfigs) != 1 {
+		t.Fatalf("unexpected saved config count: got %d want 1", len(savedConfigs))
+	}
+
+	if savedConfigs[0].Recalculate || savedConfigs[0].Recalculating {
+		t.Fatalf("expected recalculate flags to be cleared after failure, got %+v", savedConfigs[0])
 	}
 }
 
