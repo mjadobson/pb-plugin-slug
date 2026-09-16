@@ -14,33 +14,17 @@ xpb build --with github.com/mjadobson/pb-plugin-slug@latest
 
 ## Setup
 
-On startup the plugin creates a shared `_plugins` collection if it doesn't already exist.
+Install [pb-plugin-base](https://github.com/mjadobson/pb-plugin-base) in the same PocketBase build to expose the plugin's settings UI:
 
-Create or update the `slugify` row in `_plugins` with:
-
-- `plugin_name`: `slugify`
-- `enabled`: `true` or `false`
-- `config`: JSON config
-
-Example `config` value:
-
-```json
-[
-  {
-    "collection_name": "posts",
-    "input_fields": ["title", "docs.name"],
-    "output_field": "slug",
-    "length": 64,
-    "recalculate": true
-  },
-  {
-    "collection_name": "pages",
-    "input_fields": ["title"],
-    "output_field": "slug",
-    "length": 32
-  }
-]
+```sh
+xpb build
+    --with github.com/mjadobson/pb-plugin-base@latest
+    --with github.com/mjadobson/pb-plugin-slug@latest
 ```
+
+Open **Settings → Plugins → Slugify** and add one or more rules. Collections and fields are selected from the current schema. Each rule is stored as its own record in the system collection `_plugins_slug`, with `collection_name`, `input_fields`, `output_field`, `length`, `recalculating`, and `recalculation_error` fields.
+
+Existing enabled `slugify` configuration in the legacy shared `_plugins` collection is imported automatically when `_plugins_slug` is empty.
 
 Then make sure each target collection has:
 
@@ -49,9 +33,9 @@ Then make sure each target collection has:
 - a single-column `UNIQUE` index on `output_field` (recommended with `WHERE output_field != ''`)
 
 The plugin runs after successful record create and update operations.
-It reloads its active config whenever any row in `_plugins` is created, updated, or deleted.
+It reloads its active config whenever any row in `_plugins_slug` is created, updated, or deleted.
 It also reloads when collections are created, updated, or deleted so deferred configs can become active after schema changes.
-It does not backfill slugs for existing records unless you set `recalculate: true` on a config entry.
+It does not backfill slugs for existing records unless you use the **Recalculate** button.
 
 ## Unique Index Requirement
 
@@ -69,29 +53,32 @@ Replace `posts` and `slug` with your collection and field names.
 
 ## Plugin Config
 
-### `[].collection_name`
+### `collection_name`
 
 The PocketBase collection name to watch.
 
-### `[].input_fields`
+### `input_fields`
 
 The fields to combine, in order, before generating the slug.
 
 Use dotted paths such as `docs.name` to pull values from related collections.
 Intermediate segments must be relation fields.
 
-### `[].output_field`
+### `output_field`
 
 The text or editor field where the slug should be written.
 
-### `[].length`
+### `length`
 
 The maximum slug length.
 
-### `[].recalculate`
+### `recalculating`
 
-Optional.
-When set to `true`, the plugin rewrites that config entry to `recalculating: true`, recalculates matching records in batches of 100, and then removes `recalculating` when the pass finishes.
+Managed by the plugin UI. Clicking **Recalculate** sets it to `true`, starts an asynchronous backfill in batches of 100, and resets it to `false` when finished. The UI listens to PocketBase realtime events and shows a spinner while the backfill is active.
+
+### `recalculation_error`
+
+Managed by the plugin. It is cleared when a recalculation starts and stores the failure message if the backfill cannot complete. The settings UI reports that failure in a toast when the realtime completion event arrives.
 
 ## Behaviour
 
@@ -104,7 +91,7 @@ When set to `true`, the plugin rewrites that config entry to `recalculating: tru
 - If the slug already exists in the same collection, `-1`, `-2`, and so on are appended while staying within `length`.
 - If all configured inputs are blank, the output slug is cleared.
 - The output field must have its own unique index so concurrent writes cannot create duplicate slugs.
-- Invalid config entries are skipped individually so valid rules can continue to run.
+- Rules are validated when saved. Invalid pre-existing rules are skipped individually so valid rules can continue to run.
 
 ## Development
 

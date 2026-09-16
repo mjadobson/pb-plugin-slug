@@ -6,975 +6,387 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 func TestBuildSlugNormalizesAndTruncates(t *testing.T) {
-	got := buildSlug([]string{"Hello, World!", "Cafe deja vu"}, 16)
-	want := "hello-world-cafe"
-
-	if got != want {
-		t.Fatalf("unexpected slug: got %q want %q", got, want)
+	if got, want := buildSlug([]string{"Crème brûlée", "A&B"}, 16), "creme-brulee-a-b"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func TestBuildSlugRemovesAccentsAndExtraSeparators(t *testing.T) {
-	got := buildSlug([]string{"  Crème   brûlée ", "A&B"}, 64)
-	want := "creme-brulee-a-b"
-
-	if got != want {
-		t.Fatalf("unexpected slug: got %q want %q", got, want)
-	}
-}
-
-func TestPluginMetadata(t *testing.T) {
+func TestPluginMetadataForBaseRegistry(t *testing.T) {
 	p := &Plugin{}
-
-	if p.Name() != "slugify" {
-		t.Fatalf("unexpected plugin name: %q", p.Name())
-	}
-
-	if p.Description() == "" {
-		t.Fatal("expected plugin description to be non-empty")
-	}
-
-	if p.Version() == "" {
-		t.Fatal("expected plugin version to be non-empty")
+	if p.Name() != "slugify" || p.Label() != "Slugify" || p.Author() != "mjadobson" || p.Icon() == "" {
+		t.Fatal("unexpected plugin metadata")
 	}
 }
 
-func TestInitFailsForInvalidExistingOutputFieldType(t *testing.T) {
+func TestInitCreatesSystemConfigCollection(t *testing.T) {
 	app := newTestApp(t)
-
-	collection := core.NewBaseCollection("posts")
-	collection.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.NumberField{Name: "slug"},
-	)
-
-	if err := app.Save(collection); err != nil {
-		t.Fatalf("failed to save collection: %v", err)
+	if err := (&Plugin{}).Init(app); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         32,
-		},
-	})
-
-	p := &Plugin{}
-
-	err := p.Init(app)
+	collection, err := app.FindCollectionByNameOrId(configsCollectionName)
 	if err != nil {
-		t.Fatalf("expected init to succeed and skip invalid config, got %v", err)
+		t.Fatal(err)
+	}
+	if !collection.System {
+		t.Fatal("config collection must be a system collection")
+	}
+	for _, name := range []string{"collection_name", "input_fields", "output_field", "length", "recalculating", recalculationErrorField} {
+		if collection.Fields.GetByName(name) == nil {
+			t.Fatalf("missing config field %q", name)
+		}
+	}
+	length, ok := collection.Fields.GetByName("length").(*core.NumberField)
+	if !ok || !length.OnlyInt || length.Min == nil || *length.Min != 1 {
+		t.Fatal("length must be a positive integer field")
 	}
 }
 
-func TestInitFailsForDuplicateCollectionAndOutputTarget(t *testing.T) {
+func TestInitRejectsIncompatibleConfigCollection(t *testing.T) {
 	app := newTestApp(t)
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         32,
-		},
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"subtitle"},
-			OutputField:    "slug",
-			Length:         32,
-		},
-	})
-
-	p := &Plugin{}
-
-	err := p.Init(app)
-	if err != nil {
-		t.Fatalf("expected init to succeed and skip duplicate config, got %v", err)
-	}
-}
-
-func TestInitFailsWhenOutputFieldIsAlsoAnInputField(t *testing.T) {
-	app := newTestApp(t)
-
-	collection := core.NewBaseCollection("posts")
-	collection.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	collection.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
+	collection := core.NewBaseCollection(configsCollectionName)
+	collection.Fields.Add(&core.TextField{Name: "unexpected"})
 	if err := app.Save(collection); err != nil {
-		t.Fatalf("failed to save collection: %v", err)
+		t.Fatal(err)
 	}
 
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title", "slug"},
-			OutputField:    "slug",
-			Length:         32,
-		},
-	})
-
-	p := &Plugin{}
-
-	err := p.Init(app)
-	if err != nil {
-		t.Fatalf("expected init to succeed and skip invalid config, got %v", err)
+	err := (&Plugin{}).Init(app)
+	if err == nil || !strings.Contains(err.Error(), "system base collection") {
+		t.Fatalf("expected incompatible collection error, got %v", err)
 	}
 }
 
-func TestInitFailsWithoutUniqueIndexOnOutputField(t *testing.T) {
+func TestRuleValidationRejectsInvalidTarget(t *testing.T) {
 	app := newTestApp(t)
-
-	collection := core.NewBaseCollection("posts")
-	collection.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-
-	if err := app.Save(collection); err != nil {
-		t.Fatalf("failed to save collection: %v", err)
+	posts := core.NewBaseCollection("posts")
+	posts.Fields.Add(&core.TextField{Name: "title"}, &core.TextField{Name: "slug"})
+	if err := app.Save(posts); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Plugin{}).Init(app); err != nil {
+		t.Fatal(err)
 	}
 
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         32,
-		},
-	})
-
-	p := &Plugin{}
-
-	err := p.Init(app)
-	if err != nil {
-		t.Fatalf("expected init to succeed and skip invalid config, got %v", err)
+	collection, _ := app.FindCollectionByNameOrId(configsCollectionName)
+	rule := core.NewRecord(collection)
+	rule.Set("collection_name", "posts")
+	rule.Set("input_fields", []string{"title"})
+	rule.Set("output_field", "slug")
+	rule.Set("length", 64)
+	if err := app.Save(rule); err == nil {
+		t.Fatal("expected rule without a unique output index to be rejected")
 	}
 }
 
-func TestPluginPocketBaseIntegrationCreatesAndUpdatesSlugs(t *testing.T) {
+func TestLegacyMigrationRollsBackAllRowsOnFailure(t *testing.T) {
 	app := newTestApp(t)
-
-	collection := core.NewBaseCollection("posts")
-	collection.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "subtitle"},
-		&core.TextField{Name: "slug"},
-	)
-	collection.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(collection); err != nil {
-		t.Fatalf("failed to save collection: %v", err)
+	newSlugTarget(t, app, "posts")
+	if err := ensureConfigsCollection(app); err != nil {
+		t.Fatal(err)
 	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title", "subtitle"},
-			OutputField:    "slug",
-			Length:         18,
-		},
+	createLegacyConfig(t, app, []map[string]any{
+		{"collection_name": "posts", "input_fields": []string{"title"}, "output_field": "slug", "length": 64},
+		{"collection_name": "posts", "input_fields": []string{"title"}, "output_field": "slug", "length": 32},
 	})
 
-	p := &Plugin{}
+	if err := migrateLegacyConfigs(app); err == nil {
+		t.Fatal("expected duplicate migration to fail")
+	}
+	records, err := app.FindAllRecords(configsCollectionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("migration was not atomic: found %d row(s)", len(records))
+	}
+}
 
+func TestRulesAreRowsAndReloadOnCRUD(t *testing.T) {
+	app := newTestApp(t)
+	posts := newSlugTarget(t, app, "posts")
+	p := &Plugin{}
 	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
+		t.Fatal(err)
 	}
-
-	first := core.NewRecord(collection)
-	first.Set("title", "Hello World")
-	first.Set("subtitle", "Again")
-
-	if err := app.Save(first); err != nil {
-		t.Fatalf("failed to save first record: %v", err)
+	rule := createRule(t, app, "posts", []string{"title"}, "slug", 12, false)
+	record := core.NewRecord(posts)
+	record.Set("title", "A Longer Title")
+	if err := app.Save(record); err != nil {
+		t.Fatal(err)
 	}
-
-	if got := first.GetString("slug"); got != "hello-world-again" {
-		t.Fatalf("unexpected first slug: got %q want %q", got, "hello-world-again")
+	if got := record.GetString("slug"); got != "a-longer-tit" {
+		t.Fatalf("got slug %q", got)
 	}
-
-	second := core.NewRecord(collection)
-	second.Set("title", "Hello World")
-	second.Set("subtitle", "Again")
-
-	if err := app.Save(second); err != nil {
-		t.Fatalf("failed to save second record: %v", err)
+	if err := app.Delete(rule); err != nil {
+		t.Fatal(err)
 	}
-
-	if got := second.GetString("slug"); got != "hello-world-agai-1" {
-		t.Fatalf("unexpected second slug: got %q want %q", got, "hello-world-agai-1")
+	withoutRule := core.NewRecord(posts)
+	withoutRule.Set("title", "No Slug")
+	if err := app.Save(withoutRule); err != nil {
+		t.Fatal(err)
 	}
-
-	first.Set("title", "Updated title")
-	first.Set("subtitle", "2026")
-
-	if err := app.Save(first); err != nil {
-		t.Fatalf("failed to update first record: %v", err)
-	}
-
-	if got := first.GetString("slug"); got != "updated-title-2026" {
-		t.Fatalf("unexpected updated slug: got %q want %q", got, "updated-title-2026")
-	}
-
-	pluginsCollection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
-	if err != nil {
-		t.Fatalf("expected %s collection to exist: %v", pluginsCollectionName, err)
-	}
-
-	pluginRecord, err := app.FindFirstRecordByFilter(pluginsCollection, pluginNameField+" = {:pluginName}", map[string]any{"pluginName": "slugify"})
-	if err != nil {
-		t.Fatalf("expected slugify plugin record: %v", err)
-	}
-
-	if !pluginRecord.GetBool(pluginEnabledField) {
-		t.Fatal("expected slugify plugin record to be enabled")
+	if withoutRule.GetString("slug") != "" {
+		t.Fatal("deleted rule remained active")
 	}
 }
 
-func TestPluginBuildsSlugFromRelatedCollectionFields(t *testing.T) {
+func TestSlugGenerationKeepsUniquenessAndClearsBlankInputs(t *testing.T) {
 	app := newTestApp(t)
+	posts := newSlugTarget(t, app, "posts")
+	if err := (&Plugin{}).Init(app); err != nil {
+		t.Fatal(err)
+	}
+	createRule(t, app, "posts", []string{"title"}, "slug", 12, false)
 
+	first := core.NewRecord(posts)
+	first.Set("title", "A Longer Title")
+	if err := app.Save(first); err != nil {
+		t.Fatal(err)
+	}
+	second := core.NewRecord(posts)
+	second.Set("title", "A Longer Title")
+	if err := app.Save(second); err != nil {
+		t.Fatal(err)
+	}
+	if first.GetString("slug") != "a-longer-tit" || second.GetString("slug") != "a-longer-t-1" {
+		t.Fatalf("unexpected unique slugs %q and %q", first.GetString("slug"), second.GetString("slug"))
+	}
+
+	first.Set("title", "   ")
+	if err := app.Save(first); err != nil {
+		t.Fatal(err)
+	}
+	if first.GetString("slug") != "" {
+		t.Fatalf("blank input did not clear slug: %q", first.GetString("slug"))
+	}
+}
+
+func TestSlugGenerationSupportsArraysAndOneLevelRelations(t *testing.T) {
+	app := newTestApp(t)
 	docs := core.NewBaseCollection("docs")
 	docs.Fields.Add(&core.TextField{Name: "name"})
 	if err := app.Save(docs); err != nil {
-		t.Fatalf("failed to save docs collection: %v", err)
+		t.Fatal(err)
 	}
-
 	posts := core.NewBaseCollection("posts")
 	posts.Fields.Add(
 		&core.TextField{Name: "title"},
-		&core.RelationField{Name: "docs", CollectionId: docs.Id, MaxSelect: 10},
+		&core.SelectField{Name: "tags", Values: []string{"red", "blue"}, MaxSelect: 2},
+		&core.RelationField{Name: "docs", CollectionId: docs.Id, MaxSelect: 2},
 		&core.TextField{Name: "slug"},
 	)
 	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
 	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
+		t.Fatal(err)
 	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
+	if err := (&Plugin{}).Init(app); err != nil {
+		t.Fatal(err)
 	}
+	createRule(t, app, "posts", []string{"docs.name", "title", "tags"}, "slug", 64, false)
 
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"docs.name", "title"},
-			OutputField:    "slug",
-			Length:         64,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
+	doc := core.NewRecord(docs)
+	doc.Set("name", "Alpha Guide")
+	if err := app.Save(doc); err != nil {
+		t.Fatal(err)
 	}
-
-	firstDoc := core.NewRecord(docs)
-	firstDoc.Set("name", "Alpha Guide")
-	if err := app.Save(firstDoc); err != nil {
-		t.Fatalf("failed to save first doc: %v", err)
-	}
-
-	secondDoc := core.NewRecord(docs)
-	secondDoc.Set("name", "Beta Notes")
-	if err := app.Save(secondDoc); err != nil {
-		t.Fatalf("failed to save second doc: %v", err)
-	}
-
 	post := core.NewRecord(posts)
-	post.Set("title", "Launch")
-	post.Set("docs", []string{firstDoc.Id, secondDoc.Id})
-	if err := app.Save(post); err != nil {
-		t.Fatalf("failed to save post: %v", err)
-	}
-
-	if got := post.GetString("slug"); got != "alpha-guide-beta-notes-launch" {
-		t.Fatalf("unexpected slug from related fields: got %q want %q", got, "alpha-guide-beta-notes-launch")
-	}
-}
-
-func TestPluginFlattensArrayInputFieldsWithWhitespace(t *testing.T) {
-	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.SelectField{Name: "tags", Values: []string{"red", "green", "blue"}, MaxSelect: 3},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title", "tags"},
-			OutputField:    "slug",
-			Length:         64,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	post := core.NewRecord(posts)
+	post.Set("docs", []string{doc.Id})
 	post.Set("title", "Palette")
 	post.Set("tags", []string{"red", "blue"})
 	if err := app.Save(post); err != nil {
-		t.Fatalf("failed to save post: %v", err)
+		t.Fatal(err)
 	}
-
-	if got := post.GetString("slug"); got != "palette-red-blue" {
-		t.Fatalf("unexpected slug from array input: got %q want %q", got, "palette-red-blue")
+	if got, want := post.GetString("slug"), "alpha-guide-palette-red-blue"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func TestPluginClearsSlugWhenInputsAreBlank(t *testing.T) {
+func TestRecalculationUsesRecordStatusAndClearsIt(t *testing.T) {
 	app := newTestApp(t)
-
-	collection := core.NewBaseCollection("pages")
-	collection.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	collection.AddIndex("idx_pages_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(collection); err != nil {
-		t.Fatalf("failed to save collection: %v", err)
-	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "pages",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         20,
-		},
-	})
-
-	p := &Plugin{}
-
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	record := core.NewRecord(collection)
-	record.Set("title", "Landing Page")
-
-	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save record: %v", err)
-	}
-
-	record.Set("title", "   ")
-
-	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to update record with blank title: %v", err)
-	}
-
-	if got := record.GetString("slug"); got != "" {
-		t.Fatalf("expected blank slug after blank input, got %q", got)
-	}
-}
-
-func TestInitCreatesPluginsCollectionWithoutConfig(t *testing.T) {
-	app := newTestApp(t)
-
+	posts := newSlugTarget(t, app, "posts")
 	p := &Plugin{}
 	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
+		t.Fatal(err)
 	}
-
-	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
-	if err != nil {
-		t.Fatalf("expected %s collection to exist: %v", pluginsCollectionName, err)
-	}
-
-	if collection.Fields.GetByName(pluginNameField) == nil {
-		t.Fatalf("expected %s field to exist", pluginNameField)
-	}
-
-	if collection.Fields.GetByName(pluginConfigField) == nil {
-		t.Fatalf("expected %s field to exist", pluginConfigField)
-	}
-
-	if collection.Fields.GetByName(pluginEnabledField) == nil {
-		t.Fatalf("expected %s field to exist", pluginEnabledField)
-	}
-}
-
-func TestInitDefersStorageSetupUntilBootstrap(t *testing.T) {
-	dataDir := filepath.Join(t.TempDir(), "pb_data")
-	app := core.NewBaseApp(core.BaseAppConfig{
-		DataDir: dataDir,
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin before bootstrap: %v", err)
-	}
-
-	if err := app.Bootstrap(); err != nil {
-		t.Fatalf("failed to bootstrap pocketbase app: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if err := app.ResetBootstrapState(); err != nil {
-			t.Fatalf("failed to reset pocketbase app: %v", err)
-		}
-
-		if err := os.RemoveAll(dataDir); err != nil {
-			t.Fatalf("failed to remove pocketbase data dir: %v", err)
-		}
-	})
-
-	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
-	if err != nil {
-		t.Fatalf("expected %s collection to exist after bootstrap: %v", pluginsCollectionName, err)
-	}
-
-	if collection.Fields.GetByName(pluginNameField) == nil {
-		t.Fatalf("expected %s field to exist after bootstrap", pluginNameField)
-	}
-}
-
-func TestPluginReloadsConfigWhenPluginsRecordChanges(t *testing.T) {
-	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	record := core.NewRecord(posts)
-	record.Set("title", "Before Config")
-	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save pre-config record: %v", err)
-	}
-	if got := record.GetString("slug"); got != "" {
-		t.Fatalf("expected no slug before plugin config, got %q", got)
-	}
-
-	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         12,
-		},
-	})
-
-	afterCreate := core.NewRecord(posts)
-	afterCreate.Set("title", "After Config")
-	if err := app.Save(afterCreate); err != nil {
-		t.Fatalf("failed to save post-config record: %v", err)
-	}
-	if got := afterCreate.GetString("slug"); got != "after-config" {
-		t.Fatalf("unexpected slug after config create: got %q want %q", got, "after-config")
-	}
-
-	pluginRecord.Set(pluginEnabledField, false)
-	if err := app.Save(pluginRecord); err != nil {
-		t.Fatalf("failed to disable plugin config: %v", err)
-	}
-
-	afterDisable := core.NewRecord(posts)
-	afterDisable.Set("title", "After Disable")
-	if err := app.Save(afterDisable); err != nil {
-		t.Fatalf("failed to save disabled record: %v", err)
-	}
-	if got := afterDisable.GetString("slug"); got != "" {
-		t.Fatalf("expected no slug while disabled, got %q", got)
-	}
-
-	pluginRecord.Set(pluginEnabledField, true)
-	pluginRecord.SetRaw(pluginConfigField, mustJSONRaw(t, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         8,
-		},
-	}))
-	if err := app.Save(pluginRecord); err != nil {
-		t.Fatalf("failed to update plugin config: %v", err)
-	}
-
-	afterUpdate := core.NewRecord(posts)
-	afterUpdate.Set("title", "Longer Title")
-	if err := app.Save(afterUpdate); err != nil {
-		t.Fatalf("failed to save updated-config record: %v", err)
-	}
-	if got := afterUpdate.GetString("slug"); got != "longer-t" {
-		t.Fatalf("unexpected slug after config update: got %q want %q", got, "longer-t")
-	}
-
-	if err := app.Delete(pluginRecord); err != nil {
-		t.Fatalf("failed to delete plugin config: %v", err)
-	}
-
-	afterDelete := core.NewRecord(posts)
-	afterDelete.Set("title", "After Delete")
-	if err := app.Save(afterDelete); err != nil {
-		t.Fatalf("failed to save deleted-config record: %v", err)
-	}
-	if got := afterDelete.GetString("slug"); got != "" {
-		t.Fatalf("expected no slug after config delete, got %q", got)
-	}
-}
-
-func TestPluginRecalculatesExistingRecordsInBatches(t *testing.T) {
-	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	records := make([]*core.Record, 0, 105)
-	for i := 0; i < 105; i++ {
+	for i := 0; i < 3; i++ {
 		record := core.NewRecord(posts)
 		record.Set("title", fmt.Sprintf("Post %d", i))
 		if err := app.Save(record); err != nil {
-			t.Fatalf("failed to save pre-config record %d: %v", i, err)
+			t.Fatal(err)
 		}
-		records = append(records, record)
 	}
-
-	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         64,
-			Recalculate:    true,
-		},
-	})
-
-	for _, idx := range []int{0, 99, 104} {
-		refreshed, err := app.FindRecordById(posts.Id, records[idx].Id)
+	rule := createRule(t, app, "posts", []string{"title"}, "slug", 64, true)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		refreshed, err := app.FindRecordById(configsCollectionName, rule.Id)
 		if err != nil {
-			t.Fatalf("failed to reload record %d: %v", idx, err)
+			t.Fatal(err)
 		}
-
-		want := fmt.Sprintf("post-%d", idx)
-		if got := refreshed.GetString("slug"); got != want {
-			t.Fatalf("unexpected recalculated slug for record %d: got %q want %q", idx, got, want)
+		if !refreshed.GetBool("recalculating") {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("recalculation status was not cleared")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	refreshedPluginRecord, err := app.FindRecordById(pluginRecord.Collection().Id, pluginRecord.Id)
+	records, err := app.FindAllRecords(posts.Name)
 	if err != nil {
-		t.Fatalf("failed to reload plugin record: %v", err)
+		t.Fatal(err)
 	}
-
-	var savedConfigs []SlugConfig
-	if err := json.Unmarshal([]byte(refreshedPluginRecord.GetString(pluginConfigField)), &savedConfigs); err != nil {
-		t.Fatalf("failed to unmarshal saved plugin config: %v", err)
-	}
-
-	if len(savedConfigs) != 1 {
-		t.Fatalf("unexpected saved config count: got %d want 1", len(savedConfigs))
-	}
-
-	if savedConfigs[0].Recalculate || savedConfigs[0].Recalculating {
-		t.Fatalf("expected recalculate flags to be cleared, got %+v", savedConfigs[0])
+	for _, record := range records {
+		if record.GetString("slug") == "" {
+			t.Fatalf("record %s was not recalculated", record.Id)
+		}
 	}
 }
 
-func TestPluginClearsRecalculateFlagsAfterBackfillFailure(t *testing.T) {
+func TestRecalculationProcessesMoreThanOneBatch(t *testing.T) {
 	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
+	posts := newSlugTarget(t, app, "posts")
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatal(err)
 	}
+	for i := 0; i < recalculateBatchSize+5; i++ {
+		record := core.NewRecord(posts)
+		record.Set("title", fmt.Sprintf("Post %d", i))
+		if err := app.Save(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rule := createRule(t, app, "posts", []string{"title"}, "slug", 64, true)
+	waitForRecalculation(t, app, rule.Id)
 
-	blockedTitle := "Break Me"
+	records, err := app.FindAllRecords(posts.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != recalculateBatchSize+5 {
+		t.Fatalf("got %d records", len(records))
+	}
+	for _, record := range records {
+		if record.GetString("slug") == "" {
+			t.Fatalf("record %s was skipped", record.Id)
+		}
+	}
+}
+
+func TestRecalculationPersistsFailureForAdminToast(t *testing.T) {
+	app := newTestApp(t)
+	posts := newSlugTarget(t, app, "posts")
 	app.OnRecordUpdate(posts.Name).BindFunc(func(e *core.RecordEvent) error {
-		if e.Record.GetRaw(slugifyInProgressKey) == true && e.Record.GetString("title") == blockedTitle {
+		if e.Record.GetRaw(slugifyInProgressKey) == true {
 			return errors.New("forced recalc failure")
 		}
-
 		return e.Next()
 	})
-
 	p := &Plugin{}
 	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
+		t.Fatal(err)
 	}
-
-	okRecord := core.NewRecord(posts)
-	okRecord.Set("title", "Works Fine")
-	if err := app.Save(okRecord); err != nil {
-		t.Fatalf("failed to save ok record: %v", err)
-	}
-
-	badRecord := core.NewRecord(posts)
-	badRecord.Set("title", blockedTitle)
-	if err := app.Save(badRecord); err != nil {
-		t.Fatalf("failed to save blocked record: %v", err)
-	}
-
-	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         64,
-			Recalculate:    true,
-		},
-	})
-
-	refreshedPluginRecord, err := app.FindRecordById(pluginRecord.Collection().Id, pluginRecord.Id)
-	if err != nil {
-		t.Fatalf("failed to reload plugin record: %v", err)
-	}
-
-	var savedConfigs []SlugConfig
-	if err := json.Unmarshal([]byte(refreshedPluginRecord.GetString(pluginConfigField)), &savedConfigs); err != nil {
-		t.Fatalf("failed to unmarshal saved plugin config: %v", err)
-	}
-
-	if len(savedConfigs) != 1 {
-		t.Fatalf("unexpected saved config count: got %d want 1", len(savedConfigs))
-	}
-
-	if savedConfigs[0].Recalculate || savedConfigs[0].Recalculating {
-		t.Fatalf("expected recalculate flags to be cleared after failure, got %+v", savedConfigs[0])
-	}
-}
-
-func TestPluginReloadsConfigWhenPluginsRecordJSONIsSetAsString(t *testing.T) {
-	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         12,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	pluginRecord.Set(pluginConfigField, `[
-		{
-			"collection_name": "posts",
-			"input_fields": ["title"],
-			"output_field": "slug",
-			"length": 8
-		}
-	]`)
-	if err := app.Save(pluginRecord); err != nil {
-		t.Fatalf("failed to update plugin config with string json: %v", err)
-	}
-
 	record := core.NewRecord(posts)
-	record.Set("title", "Longer Title")
+	record.Set("title", "Break me")
 	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save record after string-json config update: %v", err)
+		t.Fatal(err)
 	}
-	if got := record.GetString("slug"); got != "longer-t" {
-		t.Fatalf("unexpected slug after string-json config update: got %q want %q", got, "longer-t")
-	}
-}
-
-func TestPluginClearsActiveConfigOnInvalidReload(t *testing.T) {
-	app := newTestApp(t)
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	pluginRecord := createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         20,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	first := core.NewRecord(posts)
-	first.Set("title", "Before Break")
-	if err := app.Save(first); err != nil {
-		t.Fatalf("failed to save first record: %v", err)
-	}
-	if got := first.GetString("slug"); got != "before-break" {
-		t.Fatalf("unexpected slug before invalid reload: got %q want %q", got, "before-break")
-	}
-
-	pluginRecord.SetRaw(pluginConfigField, mustJSONRaw(t, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"missing_field"},
-			OutputField:    "slug",
-			Length:         20,
-		},
-	}))
-	if err := app.Save(pluginRecord); err != nil {
-		t.Fatalf("failed to save invalid plugin config: %v", err)
-	}
-
-	second := core.NewRecord(posts)
-	second.Set("title", "After Break")
-	if err := app.Save(second); err != nil {
-		t.Fatalf("failed to save second record: %v", err)
-	}
-	if got := second.GetString("slug"); got != "" {
-		t.Fatalf("expected config to be cleared after invalid reload, got slug %q", got)
+	rule := createRule(t, app, "posts", []string{"title"}, "slug", 64, true)
+	refreshed := waitForRecalculation(t, app, rule.Id)
+	if got := refreshed.GetString(recalculationErrorField); !strings.Contains(got, "forced recalc failure") {
+		t.Fatalf("expected persisted recalculation error, got %q", got)
 	}
 }
 
-func TestPluginSkipsInvalidRulesButKeepsValidOnes(t *testing.T) {
-	app := newTestApp(t)
-
-	pages := core.NewBaseCollection("pages")
-	pages.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-		&core.TextField{Name: "slug2"},
-	)
-	pages.AddIndex("idx_pages_slug_unique", true, "`slug`", "`slug` != ''")
-	pages.AddIndex("idx_pages_slug2_unique", true, "`slug2`", "`slug2` != ''")
-
-	if err := app.Save(pages); err != nil {
-		t.Fatalf("failed to save pages collection: %v", err)
-	}
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "pages",
-			InputFields:    []string{"missing_field"},
-			OutputField:    "slug2",
-			Length:         20,
-		},
-		{
-			CollectionName: "pages",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         20,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	record := core.NewRecord(pages)
-	record.Set("title", "Valid Rule")
-	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save record: %v", err)
-	}
-	if got := record.GetString("slug"); got != "valid-rule" {
-		t.Fatalf("unexpected slug with mixed valid/invalid config rules: got %q want %q", got, "valid-rule")
-	}
-}
-
-func TestPluginReloadsWhenCollectionIsCreatedLater(t *testing.T) {
-	app := newTestApp(t)
-
-	if err := ensurePluginsCollection(app); err != nil {
-		t.Fatalf("failed to ensure plugins collection: %v", err)
-	}
-
-	createPluginConfigRecord(t, app, true, []SlugConfig{
-		{
-			CollectionName: "posts",
-			InputFields:    []string{"title"},
-			OutputField:    "slug",
-			Length:         20,
-		},
-	})
-
-	p := &Plugin{}
-	if err := p.Init(app); err != nil {
-		t.Fatalf("failed to init plugin: %v", err)
-	}
-
-	posts := core.NewBaseCollection("posts")
-	posts.Fields.Add(
-		&core.TextField{Name: "title"},
-		&core.TextField{Name: "slug"},
-	)
-	posts.AddIndex("idx_posts_slug_unique", true, "`slug`", "`slug` != ''")
-
-	if err := app.Save(posts); err != nil {
-		t.Fatalf("failed to save posts collection: %v", err)
-	}
-
-	record := core.NewRecord(posts)
-	record.Set("title", "Created Later")
-	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save record after collection create: %v", err)
-	}
-	if got := record.GetString("slug"); got != "created-later" {
-		t.Fatalf("unexpected slug after collection-triggered reload: got %q want %q", got, "created-later")
-	}
-}
-
-func createPluginConfigRecord(t *testing.T, app *core.BaseApp, enabled bool, configs []SlugConfig) *core.Record {
+func newSlugTarget(t *testing.T, app core.App, name string) *core.Collection {
 	t.Helper()
+	collection := core.NewBaseCollection(name)
+	collection.Fields.Add(&core.TextField{Name: "title"}, &core.TextField{Name: "slug"})
+	collection.AddIndex("idx_"+name+"_slug_unique", true, "`slug`", "`slug` != ''")
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
+	}
+	return collection
+}
 
-	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+func createRule(t *testing.T, app core.App, collection string, inputs []string, output string, length int, recalculating bool) *core.Record {
+	t.Helper()
+	configCollection, err := app.FindCollectionByNameOrId(configsCollectionName)
 	if err != nil {
-		t.Fatalf("failed to load %s collection: %v", pluginsCollectionName, err)
+		t.Fatal(err)
 	}
-
-	record := core.NewRecord(collection)
-	record.Set(pluginNameField, "slugify")
-	record.SetRaw(pluginConfigField, mustJSONRaw(t, configs))
-	record.Set(pluginEnabledField, enabled)
-
+	record := core.NewRecord(configCollection)
+	record.Set("collection_name", collection)
+	record.Set("input_fields", inputs)
+	record.Set("output_field", output)
+	record.Set("length", length)
+	record.Set("recalculating", recalculating)
 	if err := app.Save(record); err != nil {
-		t.Fatalf("failed to save plugin config record: %v", err)
+		t.Fatal(err)
 	}
-
 	return record
 }
 
-func mustJSONRaw(t *testing.T, value any) types.JSONRaw {
+func createLegacyConfig(t *testing.T, app core.App, configs any) {
 	t.Helper()
-
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("failed to marshal json: %v", err)
+	collection := core.NewBaseCollection("_plugins")
+	collection.Fields.Add(
+		&core.TextField{Name: "plugin_name", Required: true},
+		&core.JSONField{Name: "config", Required: true},
+		&core.BoolField{Name: "enabled"},
+	)
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
 	}
+	data, err := json.Marshal(configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := core.NewRecord(collection)
+	record.Set("plugin_name", "slugify")
+	record.Set("config", string(data))
+	record.Set("enabled", true)
+	if err := app.Save(record); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	return types.JSONRaw(data)
+func waitForRecalculation(t *testing.T, app core.App, id string) *core.Record {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		record, err := app.FindRecordById(configsCollectionName, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !record.GetBool("recalculating") {
+			return record
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recalculation status was not cleared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func newTestApp(t *testing.T) *core.BaseApp {
 	t.Helper()
-
 	dataDir := filepath.Join(t.TempDir(), "pb_data")
-	app := core.NewBaseApp(core.BaseAppConfig{
-		DataDir: dataDir,
-	})
-
+	app := core.NewBaseApp(core.BaseAppConfig{DataDir: dataDir})
 	if err := app.Bootstrap(); err != nil {
-		t.Fatalf("failed to bootstrap pocketbase app: %v", err)
+		t.Fatal(err)
 	}
-
 	t.Cleanup(func() {
 		if err := app.ResetBootstrapState(); err != nil {
-			t.Fatalf("failed to reset pocketbase app: %v", err)
+			t.Error(err)
 		}
-
-		if err := os.RemoveAll(dataDir); err != nil {
-			t.Fatalf("failed to remove pocketbase data dir: %v", err)
-		}
+		_ = os.RemoveAll(dataDir)
 	})
-
 	return app
 }

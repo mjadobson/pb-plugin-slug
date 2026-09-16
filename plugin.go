@@ -3,9 +3,11 @@ package slugify
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"reflect"
 	"regexp"
@@ -15,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/pocketbase/dbx"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/dbutils"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -24,33 +27,35 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-var version = "dev"
+var version = "v0.4.0"
 
 const slugifyInProgressKey = "@slugify_in_progress"
 const maxUniqueSlugAttempts = 32
 const recalculateBatchSize = 100
-const pluginsCollectionName = "_plugins"
-const pluginNameField = "plugin_name"
-const pluginConfigField = "config"
-const pluginEnabledField = "enabled"
+const configsCollectionName = "_plugins_slug"
+const uiExtensionName = "pb-plugin-slug"
+const recalculationErrorField = "recalculation_error"
 
 var nonAlphaNumericPattern = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 var duplicateHyphenPattern = regexp.MustCompile(`-+`)
 
 type SlugConfig struct {
+	Id             string   `json:"id"`
 	CollectionName string   `json:"collection_name"`
 	InputFields    []string `json:"input_fields"`
 	OutputField    string   `json:"output_field"`
 	Length         int      `json:"length"`
-	Recalculate    bool     `json:"recalculate,omitempty"`
 	Recalculating  bool     `json:"recalculating,omitempty"`
 }
 
 type Plugin struct {
 	mu               sync.RWMutex
 	activeConfigs    []SlugConfig
-	recalcInProgress bool
+	recalcInProgress map[string]struct{}
 }
+
+//go:embed all:ui
+var embeddedUI embed.FS
 
 func init() {
 	xpb.Register(&Plugin{})
@@ -68,7 +73,18 @@ func (p *Plugin) Description() string {
 	return "Generates normalized slugs from configured PocketBase record fields."
 }
 
+func (p *Plugin) Label() string { return "Slugify" }
+
+func (p *Plugin) Author() string { return "mjadobson" }
+
+func (p *Plugin) Icon() string { return "ri-links-line" }
+
 func (p *Plugin) Init(app core.App) error {
+	uiFS, err := fs.Sub(embeddedUI, "ui")
+	if err != nil {
+		return err
+	}
+
 	if app.IsBootstrapped() {
 		if err := p.initialize(app); err != nil {
 			return err
@@ -109,6 +125,15 @@ func (p *Plugin) Init(app core.App) error {
 		return e.Next()
 	})
 
+	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		e.UIExtensions = append(e.UIExtensions, core.UIExtension{Name: uiExtensionName, FS: uiFS})
+		return e.Next()
+	})
+
+	app.OnRecordValidate(configsCollectionName).BindFunc(func(e *core.RecordEvent) error {
+		return validateConfigRecord(e)
+	})
+
 	reloadPluginsHook := func(e *core.RecordEvent) error {
 		if err := p.reloadConfigs(e.App); err != nil {
 			e.App.Logger().Error(
@@ -121,9 +146,9 @@ func (p *Plugin) Init(app core.App) error {
 		return e.Next()
 	}
 
-	app.OnRecordAfterCreateSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
-	app.OnRecordAfterUpdateSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
-	app.OnRecordAfterDeleteSuccess(pluginsCollectionName).BindFunc(reloadPluginsHook)
+	app.OnRecordAfterCreateSuccess(configsCollectionName).BindFunc(reloadPluginsHook)
+	app.OnRecordAfterUpdateSuccess(configsCollectionName).BindFunc(reloadPluginsHook)
+	app.OnRecordAfterDeleteSuccess(configsCollectionName).BindFunc(reloadPluginsHook)
 
 	reloadCollectionsHook := func(e *core.CollectionEvent) error {
 		if err := p.reloadConfigs(e.App); err != nil {
@@ -145,7 +170,10 @@ func (p *Plugin) Init(app core.App) error {
 }
 
 func (p *Plugin) initialize(app core.App) error {
-	if err := ensurePluginsCollection(app); err != nil {
+	if err := ensureConfigsCollection(app); err != nil {
+		return err
+	}
+	if err := migrateLegacyConfigs(app); err != nil {
 		return err
 	}
 
@@ -153,6 +181,97 @@ func (p *Plugin) initialize(app core.App) error {
 		return err
 	}
 
+	return nil
+}
+
+func migrateLegacyConfigs(app core.App) error {
+	existing, err := app.FindAllRecords(configsCollectionName)
+	if err != nil || len(existing) > 0 {
+		return err
+	}
+	legacyCollection, err := app.FindCollectionByNameOrId("_plugins")
+	if err != nil {
+		return nil
+	}
+	legacy, err := app.FindFirstRecordByFilter(legacyCollection, "plugin_name = {:name}", map[string]any{"name": "slugify"})
+	if err != nil {
+		if errorsIsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !legacy.GetBool("enabled") {
+		return nil
+	}
+
+	var configs []struct {
+		CollectionName string   `json:"collection_name"`
+		InputFields    []string `json:"input_fields"`
+		OutputField    string   `json:"output_field"`
+		Length         int      `json:"length"`
+		Recalculate    bool     `json:"recalculate"`
+		Recalculating  bool     `json:"recalculating"`
+	}
+	if err := json.Unmarshal([]byte(legacy.GetString("config")), &configs); err != nil {
+		return fmt.Errorf("decode legacy slugify config: %w", err)
+	}
+	collection, err := app.FindCollectionByNameOrId(configsCollectionName)
+	if err != nil {
+		return err
+	}
+	return app.RunInTransaction(func(txApp core.App) error {
+		txCollection, err := txApp.FindCollectionByNameOrId(collection.Id)
+		if err != nil {
+			return err
+		}
+		for _, cfg := range configs {
+			record := core.NewRecord(txCollection)
+			record.Set("collection_name", cfg.CollectionName)
+			record.Set("input_fields", cfg.InputFields)
+			record.Set("output_field", cfg.OutputField)
+			record.Set("length", cfg.Length)
+			record.Set("recalculating", cfg.Recalculate || cfg.Recalculating)
+			if err := txApp.Save(record); err != nil {
+				return fmt.Errorf("migrate legacy slugify config: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func validateConfigRecord(e *core.RecordEvent) error {
+	err := e.Next()
+	errs := validation.Errors{}
+	if validationErrs, ok := err.(validation.Errors); ok {
+		errs = validationErrs
+	} else if err != nil {
+		return err
+	}
+
+	cfg := configFromRecord(e.Record)
+	if cfg.CollectionName == "" {
+		errs["collection_name"] = validation.NewError("validation_required", "Collection is required.")
+	}
+	if len(cfg.InputFields) == 0 {
+		errs["input_fields"] = validation.NewError("validation_required", "Select at least one input field.")
+	}
+	if cfg.OutputField == "" {
+		errs["output_field"] = validation.NewError("validation_required", "Output field is required.")
+	}
+	if cfg.Length <= 0 {
+		errs["length"] = validation.NewError("validation_min", "Length must be greater than zero.")
+	}
+	if len(errs) == 0 {
+		collection, findErr := e.App.FindCachedCollectionByNameOrId(cfg.CollectionName)
+		if findErr != nil {
+			errs["collection_name"] = validation.NewError("validation_not_found", "Collection does not exist.")
+		} else if validateErr := validateConfigForCollection(e.App, cfg, collection); validateErr != nil {
+			errs["input_fields"] = validation.NewError("validation_invalid_config", validateErr.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errs
+	}
 	return nil
 }
 
@@ -217,37 +336,130 @@ func validateConfigs(app core.App, pluginName string, configs []SlugConfig) []Sl
 	return validConfigs
 }
 
-func ensurePluginsCollection(app core.App) error {
-	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+func ensureConfigsCollection(app core.App) error {
+	collection, err := app.FindCollectionByNameOrId(configsCollectionName)
+	isNew := false
 	if err != nil {
 		if !errorsIsNotFound(err) {
 			return err
 		}
 
-		collection = core.NewBaseCollection(pluginsCollectionName)
+		collection = core.NewBaseCollection(configsCollectionName)
+		collection.System = true
+		isNew = true
 	}
 
-	if collection.Fields.GetByName(pluginNameField) == nil {
-		collection.Fields.Add(&core.TextField{Name: pluginNameField, Required: true})
+	if isNew {
+		collection.Fields.Add(&core.TextField{Name: "collection_name", Required: true})
+		collection.Fields.Add(&core.JSONField{Name: "input_fields", Required: true})
+		collection.Fields.Add(&core.TextField{Name: "output_field", Required: true})
+		collection.Fields.Add(&core.NumberField{Name: "length", Required: true, Min: types.Pointer(1.0), OnlyInt: true})
+		collection.Fields.Add(&core.BoolField{Name: "recalculating"})
+		collection.Fields.Add(&core.TextField{Name: recalculationErrorField})
+		collection.AddIndex("idx__plugins_slug_target_unique", true, "`collection_name`, `output_field`", "")
+		if err := app.Save(collection); err != nil {
+			return err
+		}
+	} else {
+		if collection.Type != core.CollectionTypeBase || !collection.System {
+			return fmt.Errorf("%s must be a system base collection", configsCollectionName)
+		}
+
+		needsSave := false
+		if collection.Fields.GetByName(recalculationErrorField) == nil {
+			// Schema addition introduced with asynchronous error reporting.
+			collection.Fields.Add(&core.TextField{Name: recalculationErrorField})
+			needsSave = true
+		}
+		if length, ok := collection.Fields.GetByName("length").(*core.NumberField); ok &&
+			length.Required && length.Min != nil && *length.Min == 1 && !length.OnlyInt {
+			// Upgrade collections created by the prerelease row-based config implementation.
+			length.OnlyInt = true
+			needsSave = true
+		}
+		if needsSave {
+			if err := app.Save(collection); err != nil {
+				return err
+			}
+		}
 	}
 
-	if collection.Fields.GetByName(pluginConfigField) == nil {
-		collection.Fields.Add(&core.JSONField{Name: pluginConfigField})
+	return verifyConfigsCollection(collection)
+}
+
+func verifyConfigsCollection(collection *core.Collection) error {
+	if collection.Type != core.CollectionTypeBase || !collection.System {
+		return fmt.Errorf("%s must be a system base collection", configsCollectionName)
 	}
 
-	if collection.Fields.GetByName(pluginEnabledField) == nil {
-		collection.Fields.Add(&core.BoolField{Name: pluginEnabledField})
+	type fieldCheck struct {
+		name     string
+		required bool
+		valid    func(core.Field) bool
 	}
-
-	if _, ok := dbutils.FindSingleColumnUniqueIndex(collection.Indexes, pluginNameField); !ok {
-		collection.AddIndex("idx__plugins_plugin_name_unique", true, "`plugin_name`", "")
+	checks := []fieldCheck{
+		{"collection_name", true, func(field core.Field) bool { _, ok := field.(*core.TextField); return ok }},
+		{"input_fields", true, func(field core.Field) bool { _, ok := field.(*core.JSONField); return ok }},
+		{"output_field", true, func(field core.Field) bool { _, ok := field.(*core.TextField); return ok }},
+		{"length", true, func(field core.Field) bool {
+			value, ok := field.(*core.NumberField)
+			return ok && value.Min != nil && *value.Min == 1
+		}},
+		{"recalculating", false, func(field core.Field) bool { _, ok := field.(*core.BoolField); return ok }},
+		{recalculationErrorField, false, func(field core.Field) bool { _, ok := field.(*core.TextField); return ok }},
 	}
-
-	return app.Save(collection)
+	for _, check := range checks {
+		field := collection.Fields.GetByName(check.name)
+		if field == nil || !check.valid(field) {
+			return fmt.Errorf("%s has an incompatible %q field", configsCollectionName, check.name)
+		}
+		switch value := field.(type) {
+		case *core.TextField:
+			if value.Required != check.required {
+				return fmt.Errorf("%s field %q has an incompatible required setting", configsCollectionName, check.name)
+			}
+		case *core.JSONField:
+			if value.Required != check.required {
+				return fmt.Errorf("%s field %q has an incompatible required setting", configsCollectionName, check.name)
+			}
+		case *core.NumberField:
+			if value.Required != check.required || !value.OnlyInt {
+				return fmt.Errorf("%s field %q must be a required integer", configsCollectionName, check.name)
+			}
+		case *core.BoolField:
+			if value.Required != check.required {
+				return fmt.Errorf("%s field %q has an incompatible required setting", configsCollectionName, check.name)
+			}
+		}
+	}
+	expectedFields := make(map[string]struct{}, len(checks))
+	for _, check := range checks {
+		expectedFields[check.name] = struct{}{}
+	}
+	for _, field := range collection.Fields {
+		if field.GetSystem() {
+			continue
+		}
+		if _, ok := expectedFields[field.GetName()]; !ok {
+			return fmt.Errorf("%s has unexpected field %q", configsCollectionName, field.GetName())
+		}
+	}
+	indexFound := false
+	for _, raw := range collection.Indexes {
+		index := dbutils.ParseIndex(raw)
+		if index.Unique && len(index.Columns) == 2 && strings.EqualFold(index.Columns[0].Name, "collection_name") && strings.EqualFold(index.Columns[1].Name, "output_field") {
+			indexFound = true
+			break
+		}
+	}
+	if !indexFound {
+		return fmt.Errorf("%s must have a unique collection_name/output_field index", configsCollectionName)
+	}
+	return nil
 }
 
 func (p *Plugin) reloadConfigs(app core.App) error {
-	record, enabled, err := p.loadConfigRecord(app)
+	records, err := app.FindAllRecords(configsCollectionName)
 	if err != nil {
 		p.mu.Lock()
 		p.activeConfigs = nil
@@ -256,80 +468,34 @@ func (p *Plugin) reloadConfigs(app core.App) error {
 		return err
 	}
 
-	if !enabled {
-		p.mu.Lock()
-		p.activeConfigs = nil
-		p.mu.Unlock()
-
-		return nil
-	}
-
-	configs, err := decodeConfigs(record.GetRaw(pluginConfigField))
-	if err != nil {
-		p.mu.Lock()
-		p.activeConfigs = nil
-		p.mu.Unlock()
-
-		return fmt.Errorf("%s: %w", p.Name(), err)
-	}
-
-	if hasRecalculateRequest(configs) && p.beginRecalculation() {
-		defer p.endRecalculation()
-
-		configs, err = p.runRecalculation(app, record, configs)
-		if err != nil {
-			p.mu.Lock()
-			p.activeConfigs = nil
-			p.mu.Unlock()
-
-			return err
-		}
+	configs := make([]SlugConfig, 0, len(records))
+	for _, record := range records {
+		configs = append(configs, configFromRecord(record))
 	}
 
 	p.mu.Lock()
 	p.activeConfigs = slicesClone(validateConfigs(app, p.Name(), configs))
 	p.mu.Unlock()
 
+	for _, cfg := range configs {
+		if cfg.Recalculating && p.beginRecalculation(cfg.Id) {
+			go p.runRecalculation(app, cfg)
+		}
+	}
+
 	return nil
 }
 
-func (p *Plugin) loadConfigRecord(app core.App) (*core.Record, bool, error) {
-	record, err := app.FindFirstRecordByFilter(
-		pluginsCollectionName,
-		pluginNameField+" = {:pluginName}",
-		map[string]any{"pluginName": p.Name()},
-	)
-	if err != nil {
-		if errorsIsNotFound(err) {
-			return nil, false, nil
-		}
-
-		return nil, false, err
+func configFromRecord(record *core.Record) SlugConfig {
+	return SlugConfig{
+		Id: record.Id, CollectionName: record.GetString("collection_name"),
+		InputFields: record.GetStringSlice("input_fields"), OutputField: record.GetString("output_field"),
+		Length: record.GetInt("length"), Recalculating: record.GetBool("recalculating"),
 	}
-
-	if !record.GetBool(pluginEnabledField) {
-		return nil, false, nil
-	}
-
-	return record, true, nil
-}
-
-func decodeConfigs(rawValue any) ([]SlugConfig, error) {
-	raw, ok := rawValue.(types.JSONRaw)
-	if !ok {
-		return nil, fmt.Errorf("config field is not json")
-	}
-
-	var configs []SlugConfig
-	if err := json.Unmarshal(raw, &configs); err != nil {
-		return nil, fmt.Errorf("invalid config json: %w", err)
-	}
-
-	return configs, nil
 }
 
 func (p *Plugin) handleRecordEvent(ctx context.Context, app core.App, record *core.Record) error {
-	if record.Collection().Name == pluginsCollectionName {
+	if record.Collection().Name == configsCollectionName {
 		return nil
 	}
 
@@ -743,103 +909,52 @@ func isUniqueConstraintError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
 }
 
-func hasRecalculateRequest(configs []SlugConfig) bool {
-	for _, cfg := range configs {
-		if cfg.Recalculate {
-			return true
-		}
-	}
-
-	return false
-}
-
-func normalizeRecalculateFlags(configs []SlugConfig) []SlugConfig {
-	normalized := slicesClone(configs)
-	for i := range normalized {
-		if normalized[i].Recalculate {
-			normalized[i].Recalculate = false
-			normalized[i].Recalculating = true
-		}
-	}
-
-	return normalized
-}
-
-func clearRecalculatingFlags(configs []SlugConfig) []SlugConfig {
-	cleared := slicesClone(configs)
-	for i := range cleared {
-		cleared[i].Recalculate = false
-		cleared[i].Recalculating = false
-	}
-
-	return cleared
-}
-
-func (p *Plugin) beginRecalculation() bool {
+func (p *Plugin) beginRecalculation(recordID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.recalcInProgress {
+	if p.recalcInProgress == nil {
+		p.recalcInProgress = make(map[string]struct{})
+	}
+	if _, ok := p.recalcInProgress[recordID]; ok {
 		return false
 	}
 
-	p.recalcInProgress = true
+	p.recalcInProgress[recordID] = struct{}{}
 	return true
 }
 
-func (p *Plugin) endRecalculation() {
+func (p *Plugin) endRecalculation(recordID string) {
 	p.mu.Lock()
-	p.recalcInProgress = false
+	delete(p.recalcInProgress, recordID)
 	p.mu.Unlock()
 }
 
-func (p *Plugin) runRecalculation(app core.App, record *core.Record, configs []SlugConfig) (finalConfigs []SlugConfig, err error) {
-	runningConfigs := normalizeRecalculateFlags(configs)
-	if err := updatePluginConfigRecord(app, record, runningConfigs); err != nil {
-		return nil, err
+func (p *Plugin) runRecalculation(app core.App, cfg SlugConfig) {
+	defer p.endRecalculation(cfg.Id)
+	var recalcErr error
+	if valid := validateConfigs(app, p.Name(), []SlugConfig{cfg}); len(valid) == 1 {
+		recalcErr = recalculateCollection(app, valid[0])
+	} else {
+		recalcErr = errors.New("slug rule is no longer valid")
+	}
+	if recalcErr != nil {
+		app.Logger().Error("slugify recalculation failed", slog.String("configId", cfg.Id), slog.Any("error", recalcErr))
 	}
 
-	defer func() {
-		clearedConfigs := clearRecalculatingFlags(runningConfigs)
-		cleanupErr := updatePluginConfigRecord(app, record, clearedConfigs)
-		if cleanupErr != nil {
-			cleanupErr = fmt.Errorf("failed to clear recalculation flags: %w", cleanupErr)
-			if err != nil {
-				err = errors.Join(err, cleanupErr)
-			} else {
-				err = cleanupErr
-			}
-			return
-		}
-
-		if err == nil {
-			finalConfigs = clearedConfigs
-		}
-	}()
-
-	for _, cfg := range validateConfigs(app, p.Name(), runningConfigs) {
-		if !cfg.Recalculating {
-			continue
-		}
-
-		if err := recalculateCollection(app, cfg); err != nil {
-			return nil, err
-		}
-	}
-
-	return finalConfigs, nil
-}
-
-func updatePluginConfigRecord(app core.App, record *core.Record, configs []SlugConfig) error {
-	raw, err := json.Marshal(configs)
+	record, err := app.FindRecordById(configsCollectionName, cfg.Id)
 	if err != nil {
-		return err
+		return
 	}
-
-	record.SetRaw(pluginConfigField, types.JSONRaw(raw))
-	record.Set("updated", types.NowDateTime())
-
-	return app.SaveNoValidate(record)
+	record.Set("recalculating", false)
+	if recalcErr == nil {
+		record.Set(recalculationErrorField, "")
+	} else {
+		record.Set(recalculationErrorField, recalcErr.Error())
+	}
+	if err := app.SaveNoValidate(record); err != nil {
+		app.Logger().Error("slugify failed to clear recalculation status", slog.String("configId", cfg.Id), slog.Any("error", err))
+	}
 }
 
 func recalculateCollection(app core.App, cfg SlugConfig) error {

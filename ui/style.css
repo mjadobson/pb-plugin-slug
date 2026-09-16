@@ -1,0 +1,59 @@
+.slug-rule summary {
+  flex-wrap: wrap;
+}
+
+.slug-rule-form {
+  display: block;
+  padding: var(--smSpacing) 0;
+}
+
+.slug-rule-actions,
+.slug-rule-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.slug-rule-actions {
+  justify-content: space-between;
+  margin-top: var(--spacing);
+  padding-top: var(--smSpacing);
+  border-top: 1px solid var(--surfaceAlt2Color);
+}
+
+.slug-rule-actions-right {
+  justify-content: flex-end;
+}
+
+.slug-rule-actions .ri-loader-4-line {
+  display: inline-block;
+  animation: slug-spin 0.8s linear infinite;
+}
+
+.slug-loading {
+  min-height: 8rem;
+  display: grid;
+  place-items: center;
+}
+
+@media (max-width: 480px) {
+  .slug-rule-actions,
+  .slug-rule-actions-right {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .slug-rule-actions .btn,
+  .slug-rule-actions-right .btn {
+    width: 100%;
+  }
+}
+
+@keyframes slug-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
