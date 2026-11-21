@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 )
 
 func TestBuildSlugNormalizesAndTruncates(t *testing.T) {

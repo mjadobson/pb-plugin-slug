@@ -2,14 +2,24 @@
 
 Generate PocketBase slugs from one or more record fields.
 
+![Slugify settings in the PocketBase Superuser UI](./docs/images/screenshot.png)
+
 The plugin combines configured input fields in order, normalizes the text to lowercase alphanumeric segments separated by hyphens, truncates the result to the configured length, and adds numeric suffixes when needed to keep slugs unique.
 
 ## Installation
 
+Slugify `v0.5.0` uses PocketBase `v0.42.3`, xpb `v0.1.0`, and Go `1.27.1+`. Custom Go applications must use the new `ganigeorgiev.com/pocketbase/*` imports.
+
+Install the xpb CLI:
+
+```sh
+go install github.com/pocketbuilds/xpb/cmd/xpb@v0.1.0
+```
+
 Build PocketBase with the plugin:
 
 ```sh
-xpb build --with github.com/mjadobson/pb-plugin-slug@latest
+xpb build v0.42.3 --with github.com/mjadobson/pb-plugin-slug@v0.5.0
 ```
 
 ## Setup
@@ -17,9 +27,10 @@ xpb build --with github.com/mjadobson/pb-plugin-slug@latest
 Install [pb-plugin-base](https://github.com/mjadobson/pb-plugin-base) in the same PocketBase build to expose the plugin's settings UI:
 
 ```sh
-xpb build
-    --with github.com/mjadobson/pb-plugin-base@latest
-    --with github.com/mjadobson/pb-plugin-slug@latest
+xpb build v0.42.3 \
+    --with github.com/pocketbuilds/xpb@v0.1.0 \
+    --with github.com/mjadobson/pb-plugin-base@v0.3.0 \
+    --with github.com/mjadobson/pb-plugin-slug@v0.5.0
 ```
 
 Open **Settings → Plugins → Slugify** and add one or more rules. Collections and fields are selected from the current schema. Each rule is stored as its own record in the system collection `_plugins_slug`, with `collection_name`, `input_fields`, `output_field`, `length`, `recalculating`, and `recalculation_error` fields.
@@ -95,8 +106,25 @@ Managed by the plugin. It is cleared when a recalculation starts and stores the 
 
 ## Development
 
+Build a PocketBase binary with this local plugin and the pinned pb-plugin-base release:
+
+```sh
+make build-pocketbase-binary
+```
+
+To test against a local pb-plugin-base checkout:
+
+```sh
+make build-pocketbase-binary BASE_PLUGIN="github.com/mjadobson/pb-plugin-base=$(cd ../pb-plugin-base && pwd)"
+```
+
+Run the checks:
+
 ```sh
 go mod tidy
 GOCACHE=/tmp/go-build go test ./...
+GOCACHE=/tmp/go-build go test -race ./...
+GOCACHE=/tmp/go-build go vet ./...
 GOCACHE=/tmp/go-build go build ./...
+node --check ui/main.js
 ```
